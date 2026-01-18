@@ -33,25 +33,52 @@ struct float2x2 {
 constexpr int D_Q = 576;
 constexpr int D_K = 576;
 constexpr int D_V = 512;
+constexpr int D_ROPE = D_Q - D_V;  // 64 - RoPE 维度
 constexpr float MAX_INIT_VAL = -1e30f;
 
 // Block dimensions - Head64 configuration
 constexpr int B_H = 64;         // Head block size
 constexpr int B_TOPK = 64;      // TopK block size
-constexpr int NUM_BUFS = 3;     // Pipeline depth
+constexpr int NUM_BUFS = 2;     // Pipeline depth (减少到2以节省共享内存)
 constexpr int NUM_THREADS = 384; // 128 scale threads + 128 TMA threads + 128 MMA threads
 
+// 共享内存使用估算 (227 KB 限制):
+// - k_buf[2]: 64 × 576 × 2 × 2 = 147,456 bytes
+// - s_buf + ds_buf: 8,192 × 2 = 16,384 bytes
+// - p_exchange_buf: 16,384 bytes
+// - barriers + misc: ~3,000 bytes
+// 总计: ~183 KB ✓
+
 // TMEM column layout for backward
+// 优化：复用 TMEM 空间以适应 512 列限制
+// 
+// SM100 TMEM 规格: 128行 × 512列 × 4字节 = 256KB
+// 
+// 分时复用策略：
+// - dQ 累加器在整个 kernel 生命周期内持续使用
+// - dKV_nope 和 dK_rope 每个 k block 计算后立即原子加到全局内存，可以复用
+// - P 矩阵和 Q_part 可以与 dKV 区域复用（分阶段使用）
+//
+// 布局（512列内）：
+//   0 ~ 288: dQ accumulator (B_H=64 rows, D_Q=576 -> 288 TMEM cols)
+// 288 ~ 320: P matrix (B_H=64 rows, B_TOPK=64 -> 32 cols) [阶段1]
+// 288 ~ 480: dKV_nope accumulator (B_TOPK=64, D_V=512/2=256 cols, 分两批处理)
+//            - 第一批: cols 0-127 使用 TMEM 288-416
+//            - 第二批: cols 128-255 复用 TMEM 288-416
+// 480 ~ 512: dK_rope (32 cols) + Q_part 临时区 (复用)
 namespace tmem_cols {
-    //   0 ~ 256: dQ accumulator
-    // 256 ~ 384: dKV accumulator (reused for dK and dV)
-    // 384 ~ 448: P/dP matrix
-    // 448 ~ 512: Q partition for dK computation
-    constexpr int dQ = 0;
-    constexpr int dKV = 256;
-    constexpr int P = 384;
-    constexpr int Q_part = 448;
+    constexpr int dQ = 0;            // 0 ~ 288: dQ 累加器（常驻）
+    constexpr int P = 288;           // 288 ~ 320: P 矩阵（与 dKV 分时复用）
+    constexpr int dKV_nope = 288;    // 288 ~ 416: dKV_nope 分批处理 (128 cols/批)
+    constexpr int dK_rope = 416;     // 416 ~ 448: dK_rope (32 cols)
+    constexpr int Q_part = 448;      // 448 ~ 512: Q partition (64 cols)
+    
+    // 分批处理常量
+    constexpr int DKV_BATCH_COLS = 128;  // 每批处理 128 列 (256维)
+    constexpr int DKV_NUM_BATCHES = 2;   // 共 2 批
 }
+
+// 总使用: 288 + 128 + 32 + 64 = 512 列 ✓
 
 // Shared memory layouts
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
@@ -116,13 +143,11 @@ struct SharedMemoryPlan {
     union {
         // Configuration 1: For dQ computation (dQ += dS @ K)
         struct {
-            array_aligned<bf16, cosize_v<SmemLayoutP>> dS;           // dS matrix [B_H, B_TOPK]
             array_aligned<bf16, cosize_v<SmemLayoutK>> k_buf[NUM_BUFS]; // K buffers
         } dQ_cfg;
         
         // Configuration 2: For dK/dV computation
         struct {
-            array_aligned<bf16, cosize_v<SmemLayoutP>> p_buf;        // P matrix [B_H, B_TOPK]
             array_aligned<bf16, cosize_v<SmemLayoutdO>> do_buf;      // dO matrix [B_H, D_V]
             array_aligned<bf16, cosize_v<SmemLayoutQ>> q_buf;        // Q matrix [B_H, D_V]
             array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope_buf; // Q RoPE [B_H, 64]
@@ -135,11 +160,11 @@ struct SharedMemoryPlan {
     // P exchange buffer for cross-warp communication
     float p_exchange_buf[4][32 * (B_TOPK/2)];
     
-    // S/dP storage (can overlap with Q_RoPE in some phases)
-    union {
-        bf16 s[B_H * B_TOPK];
-        array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;
-    } s_q_rope;
+    // 修复：S 和 dS 使用独立的存储空间
+    // S 用于计算 dV = S^T @ dO
+    // dS 用于计算 dK = dS^T @ Q 和 dQ += dS @ K
+    bf16 s_buf[B_H * B_TOPK];    // 存储 S (softmax 输出)
+    bf16 ds_buf[B_H * B_TOPK];   // 存储 dS (softmax 梯度)
     
     // Validity masks for indices
     char is_k_valid[NUM_BUFS][B_TOPK/8];
@@ -159,7 +184,8 @@ struct SharedMemoryPlan {
     
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     transac_bar_t bar_p_free;
-    transac_bar_t bar_so_ready;
+    transac_bar_t bar_s_ready;   // S 计算完成信号
+    transac_bar_t bar_ds_ready;  // dS 计算完成信号
     
     // TMEM allocation tracking
     array_aligned<uint32_t, 1> tmem_start_addr;

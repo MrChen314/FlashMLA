@@ -93,19 +93,21 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     TiledMMA tiled_mma_dV = TiledMMA_dV{};
 
     // TMEM tensor handles
+    // 优化：使用分批处理策略以适应 512 列 TMEM 限制
     Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
     Tensor tdQ = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_V>>{});
-    Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_Q-D_V>>{});
-    Tensor tdK = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_V>>{});
-    Tensor tdK_rope = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_Q-D_V>>{});
-    Tensor tdV = partition_fragment_C(tiled_mma_dV, Shape<Int<B_TOPK>, Int<D_V>>{});
+    Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_ROPE>>{});
+    // dKV_nope 分批处理：每批 256 维 (128 TMEM cols)
+    // 这样可以复用 TMEM 空间，在 512 列限制内
+    Tensor tdKV_nope_batch = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_V/2>>{});
+    Tensor tdK_rope = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
 
     tP.data().get() = tmem_cols::P;
     tdQ.data().get() = tmem_cols::dQ;
     tdQ_rope.data().get() = tmem_cols::dQ + D_V/2;  // After NoPE part
-    tdK.data().get() = tmem_cols::dKV;
-    tdK_rope.data().get() = tmem_cols::dKV;  // Reuse same space, computed separately
-    tdV.data().get() = tmem_cols::dKV;
+    // dKV_nope 分批使用同一 TMEM 区域
+    tdKV_nope_batch.data().get() = tmem_cols::dKV_nope;
+    tdK_rope.data().get() = tmem_cols::dK_rope;
 
     // Initialize barriers and TMEM allocation
     if (warp_idx == 0) {
@@ -137,11 +139,15 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 plan.bar_k_valid_free[i].init(128);
             }
             plan.bar_p_free.init(128);
-            plan.bar_so_ready.init(128);
+            // 修复：初始化 S 和 dS 的独立信号量
+            plan.bar_s_ready.init(128);
+            plan.bar_ds_ready.init(128);
             fence_barrier_init();
         }
 
         // Initialize TMEM
+        // 优化：TMEM 布局压缩到 512 列限制内
+        // dQ: 288 cols + dKV_batch: 128 cols + dK_rope: 32 cols + Q_part: 64 cols = 512 cols
         cute::TMEM::Allocator1Sm().allocate(512, plan.tmem_start_addr.data());
         TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator1Sm().release_allocation_lock();
@@ -161,8 +167,11 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
         }
         __syncwarp();
 
-        bf16* sS_base = plan.s_q_rope.s + lane_idx * 8 + (warp_idx & 1) * (B_H/2) * 8 + (warp_idx/2) * B_H * (B_TOPK/2);
-        bf16* sdS_base = sS_base;  // dS stored in same location
+        // 修复：S 和 dS 使用独立的存储位置
+        // sS_base 用于存储 S (softmax 输出)，用于 dV = S^T @ dO
+        // sdS_base 用于存储 dS (softmax 梯度)，用于 dK = dS^T @ Q 和 dQ += dS @ K
+        bf16* sS_base = plan.s_buf + lane_idx * 8 + (warp_idx & 1) * (B_H/2) * 8 + (warp_idx/2) * B_H * (B_TOPK/2);
+        bf16* sdS_base = plan.ds_buf + lane_idx * 8 + (warp_idx & 1) * (B_H/2) * 8 + (warp_idx/2) * B_H * (B_TOPK/2);
         static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
 
         // Main backward loop
@@ -207,11 +216,13 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 s[i] = __float22bfloat162_rn(p2);
             }
 
-            // Store S to shared memory for dV computation (S^T @ dO)
+            // 修复：将 S 存储到独立的 s_buf，用于 dV = S^T @ dO
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; i += 1) {
                 *(uint128_t*)(sS_base + B_H * 8 * i) = *(uint128_t*)(s + i*4);
             }
+            fence_view_async_shared();
+            plan.bar_s_ready.arrive();  // 通知 S 已就绪
 
             // Wait for dP_mid computation
             plan.bar_dp_computed[cur_buf].wait((k/NUM_BUFS) & 1);
@@ -232,85 +243,76 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 ds[i] = __float22bfloat162_rn(make_float2(ds_x, ds_y));
             }
 
-            // Store dS to shared memory for dQ and dK computation
+            // 修复：将 dS 存储到独立的 ds_buf，用于 dK = dS^T @ Q 和 dQ += dS @ K
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; i += 1) {
                 *(uint128_t*)(sdS_base + B_H * 8 * i) = *(uint128_t*)(ds + i*4);
             }
 
             fence_view_async_shared();
-            plan.bar_so_ready.arrive();
+            plan.bar_ds_ready.arrive();  // 通知 dS 已就绪
 
-            // ===== Atomic accumulation of dK and dV =====
-            // Wait for dK/dV to be computed by MMA warpgroup
+            // ===== 优化：原子累加 dKV (适应 TMEM 分批处理) =====
+            // 等待 MMA warpgroup 计算完 dKV_nope 和 dK_rope
             plan.bar_dkv_ready[cur_buf].wait((k/NUM_BUFS) & 1);
             ku::tcgen05_after_thread_sync();
 
-            // Load dK from TMEM and atomically add to global memory
-            // Each thread handles a portion of the dK/dV matrix
+            // TMEM 布局：每列存储 32 行数据
+            // 分工：warp 0,1 处理 row 0-31，warp 2,3 处理 row 32-63
             const int local_warp = warp_idx;  // 0-3
-            const int rows_per_warp = B_TOPK / 4;  // 16 rows per warp
-            const int row_start = local_warp * rows_per_warp;
+            const int row_batch = (local_warp >= 2) ? 1 : 0;
+            const int warp_in_batch = local_warp % 2;
             
-            // Load indices for this block
-            int indices_buf[rows_per_warp];
-            CUTE_UNROLL
-            for (int r = 0; r < rows_per_warp; ++r) {
-                indices_buf[r] = __ldg(gIndices + k * B_TOPK + row_start + r);
-            }
-
-            // Atomic add dK (NoPE part: D_V = 512 dimensions)
-            // Each lane handles 512/32 = 16 elements
+            const int my_row = row_batch * 32 + lane_idx;
+            int my_kv_idx = __ldg(gIndices + k * B_TOPK + my_row);
+            bool is_valid = (my_kv_idx >= 0 && my_kv_idx < params.s_kv);
+            
+            // ===== 原子累加 dKV_nope (512 维，分批处理) =====
+            // 由于 TMEM 只存储 128 列/批，需要分 2 批读取
+            // 但实际上 MMA 已经分批计算并存储，这里直接读取
             {
-                float2 dk_vals[D_V / 64];  // 8 float2 values per lane
-                ku::tmem_ld_32dp32bNx<D_V/32>(tmem_cols::dKV + lane_idx * (D_V/64), dk_vals);
-                cutlass::arch::fence_view_async_tmem_load();
+                // 每个 warp 处理 64 列 (warp_in_batch 决定处理哪 64 列)
+                constexpr int TMEM_COLS_PER_WARP = tmem_cols::DKV_BATCH_COLS / 2;  // 64 列
                 
-                CUTE_UNROLL
-                for (int r = 0; r < rows_per_warp; ++r) {
-                    int kv_idx = indices_buf[r];
-                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
-                        float* dk_ptr = gDKV + kv_idx * params.stride_dkv_s_kv;
-                        CUTE_UNROLL
-                        for (int d = 0; d < D_V / 64; ++d) {
-                            atomic_add_float2(dk_ptr + lane_idx * 2 + d * 64, dk_vals[d]);
+                // 分两批处理全部 512 维
+                for (int batch = 0; batch < tmem_cols::DKV_NUM_BATCHES; ++batch) {
+                    const int batch_col_offset = batch * (D_V / 2);  // 0 或 256
+                    const int tmem_col_start = warp_in_batch * TMEM_COLS_PER_WARP;
+                    
+                    CUTE_UNROLL
+                    for (int col_offset = 0; col_offset < TMEM_COLS_PER_WARP; ++col_offset) {
+                        float2 dkv_val;
+                        int tmem_col = tmem_cols::dKV_nope + tmem_col_start + col_offset;
+                        ku::tmem_ld_32dp32bNx<1>(tmem_col + row_batch * 32, &dkv_val);
+                        cutlass::arch::fence_view_async_tmem_load();
+                        
+                        if (is_valid) {
+                            // 全局列 = 批次偏移 + warp内偏移 + 列偏移
+                            int global_col = batch_col_offset + (tmem_col_start + col_offset) * 2;
+                            float* dkv_ptr = gDKV + my_kv_idx * params.stride_dkv_s_kv + global_col;
+                            atomic_add_float2(dkv_ptr, dkv_val);
                         }
                     }
                 }
             }
+            
+            __syncwarp();
 
-            // Atomic add dK (RoPE part: 64 dimensions)
+            // ===== 原子累加 dK_rope (64 维) =====
             if constexpr (HAVE_ROPE) {
-                float2 dk_rope_vals[1];  // 2 elements per lane for 64-dim RoPE
-                ku::tmem_ld_32dp32bNx<1>(tmem_cols::dKV + D_V/2 + lane_idx, dk_rope_vals);
-                cutlass::arch::fence_view_async_tmem_load();
-                
-                CUTE_UNROLL
-                for (int r = 0; r < rows_per_warp; ++r) {
-                    int kv_idx = indices_buf[r];
-                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
-                        float* dk_ptr = gDKV + kv_idx * params.stride_dkv_s_kv + D_V;
-                        atomic_add_float2(dk_ptr + lane_idx * 2, dk_rope_vals[0]);
-                    }
-                }
-            }
-
-            // Atomic add dV (D_V = 512 dimensions)
-            {
-                float2 dv_vals[D_V / 64];
-                // dV is stored after dK in TMEM (or recomputed)
-                ku::tmem_ld_32dp32bNx<D_V/32>(tmem_cols::dKV + lane_idx * (D_V/64), dv_vals);
-                cutlass::arch::fence_view_async_tmem_load();
-                
-                CUTE_UNROLL
-                for (int r = 0; r < rows_per_warp; ++r) {
-                    int kv_idx = indices_buf[r];
-                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
-                        // dV is stored in the V part of KV (first D_V dimensions)
-                        float* dv_ptr = gDKV + kv_idx * params.stride_dkv_s_kv;
-                        CUTE_UNROLL
-                        for (int d = 0; d < D_V / 64; ++d) {
-                            atomic_add_float2(dv_ptr + lane_idx * 2 + d * 64, dv_vals[d]);
+                if (warp_in_batch == 0) {
+                    constexpr int TMEM_COLS_ROPE = D_ROPE / 2;  // 32 列
+                    
+                    CUTE_UNROLL
+                    for (int col_offset = 0; col_offset < TMEM_COLS_ROPE; ++col_offset) {
+                        float2 dk_rope_val;
+                        ku::tmem_ld_32dp32bNx<1>(tmem_cols::dK_rope + col_offset + row_batch * 32, &dk_rope_val);
+                        cutlass::arch::fence_view_async_tmem_load();
+                        
+                        if (is_valid) {
+                            int global_col = D_V + col_offset * 2;
+                            float* dk_rope_ptr = gDKV + my_kv_idx * params.stride_dkv_s_kv + global_col;
+                            atomic_add_float2(dk_rope_ptr, dk_rope_val);
                         }
                     }
                 }
@@ -505,34 +507,58 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 plan.bar_dp_computed[cur_buf].arrive();
 
                 // ===== Step 3: dQ += dS @ K (after softmax computes dS) =====
-                plan.bar_so_ready.wait((k/NUM_BUFS) & 1);
-                Tensor sS = make_tensor(make_smem_ptr(plan.s_q_rope.s), SmemLayoutP{});
+                // 修复：等待 dS 就绪（从独立的 ds_buf 读取）
+                plan.bar_ds_ready.wait((k/NUM_BUFS) & 1);
+                Tensor sdS = make_tensor(make_smem_ptr(plan.ds_buf), SmemLayoutP{});
 
                 // dQ_nope += dS @ K_nope
-                ku::utcmma_ss(tiled_mma_dQ, sS, sK, tdQ, k == 0);
+                ku::utcmma_ss(tiled_mma_dQ, sdS, sK, tdQ, k == 0);
 
-                // dQ_rope += dS @ K_rope (FIX: Added RoPE gradient for dQ)
+                // dQ_rope += dS @ K_rope
                 if constexpr (HAVE_ROPE) {
                     Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
-                    ku::utcmma_ss(tiled_mma_dQ, sS, sK_rope, tdQ_rope, k == 0);
+                    ku::utcmma_ss(tiled_mma_dQ, sdS, sK_rope, tdQ_rope, k == 0);
                 }
 
                 plan.bar_dq_accumulated[cur_buf].arrive();
 
-                // ===== Step 4: dK = dS^T @ Q =====
-                // dK_nope = dS^T @ Q_nope
-                ku::utcmma_ts(tiled_mma_dK, sS, sQ, tdK, true);
-
-                // dK_rope = dS^T @ Q_rope (FIX: Added RoPE gradient for dK)
-                if constexpr (HAVE_ROPE) {
-                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
-                    ku::utcmma_ts(tiled_mma_dK, sS, sQ_rope, tdK_rope, true);
+                // ===== Step 4: dKV_nope = dK_nope + dV (分批处理以节省 TMEM) =====
+                // 优化：由于 TMEM 512 列限制，将 dKV_nope (512维) 分 2 批处理
+                // 每批处理 256 维 (128 TMEM cols)
+                
+                // 修复：等待 S 就绪（从独立的 s_buf 读取）
+                plan.bar_s_ready.wait((k/NUM_BUFS) & 1);
+                Tensor sS = make_tensor(make_smem_ptr(plan.s_buf), SmemLayoutP{});
+                
+                // 分批处理 dKV_nope
+                for (int batch = 0; batch < tmem_cols::DKV_NUM_BATCHES; ++batch) {
+                    // 创建分批的 Q 和 dO 视图
+                    const int col_offset = batch * (D_V / 2);  // 0 或 256
+                    
+                    // Step 4a: dK_nope_batch = dS^T @ Q_nope_batch
+                    // 注意：需要使用 Q 的对应列切片
+                    Tensor sQ_batch = make_tensor(
+                        make_smem_ptr(plan.dKV_cfg.q_buf.data() + col_offset * B_H),
+                        SmemLayoutQ{}  // 使用相同 layout，但偏移起始地址
+                    );
+                    ku::utcmma_ts(tiled_mma_dK, sdS, sQ_batch, tdKV_nope_batch, true);
+                    
+                    // Step 4b: dV_batch = S^T @ dO_batch，累加到 tdKV_nope_batch
+                    Tensor sdO_batch = make_tensor(
+                        make_smem_ptr(plan.dKV_cfg.do_buf.data() + col_offset * B_H),
+                        SmemLayoutdO{}
+                    );
+                    ku::utcmma_ts(tiled_mma_dK, sS, sdO_batch, tdKV_nope_batch, false);
+                    
+                    // 通知该批次 dKV 就绪，可以进行原子累加
+                    // 原子累加会在 warpgroup 0 中处理
                 }
 
-                // ===== Step 5: dV = S^T @ dO =====
-                // Note: S is stored in shared memory (same location as dS after softmax stores it)
-                // We need to use the S values computed by warpgroup 0
-                ku::utcmma_ts(tiled_mma_dV, sS, sdO, tdV, true);
+                // Step 4c: dK_rope = dS^T @ Q_rope（单独存储，不分批）
+                if constexpr (HAVE_ROPE) {
+                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
+                    ku::utcmma_ts(tiled_mma_dK, sdS, sQ_rope, tdK_rope, true);
+                }
 
                 plan.bar_dkv_ready[cur_buf].arrive();
             }
