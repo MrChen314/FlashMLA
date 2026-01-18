@@ -283,7 +283,8 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     for (int col_offset = 0; col_offset < TMEM_COLS_PER_WARP; ++col_offset) {
                         float2 dkv_val;
                         int tmem_col = tmem_cols::dKV_nope + tmem_col_start + col_offset;
-                        ku::tmem_ld_32dp32bNx<1>(tmem_col + row_batch * 32, &dkv_val);
+                        // 修复：TMEM 地址偏移需要乘以 128 (每列 128 字节)
+                        ku::tmem_ld_32dp32bNx<1>(tmem_col + row_batch * (32 * 128 / 4), &dkv_val);
                         cutlass::arch::fence_view_async_tmem_load();
                         
                         if (is_valid) {
@@ -306,7 +307,8 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     CUTE_UNROLL
                     for (int col_offset = 0; col_offset < TMEM_COLS_ROPE; ++col_offset) {
                         float2 dk_rope_val;
-                        ku::tmem_ld_32dp32bNx<1>(tmem_cols::dK_rope + col_offset + row_batch * 32, &dk_rope_val);
+                        // 修复：TMEM 地址偏移需要乘以 128 (每列 128 字节)
+                        ku::tmem_ld_32dp32bNx<1>(tmem_cols::dK_rope + col_offset + row_batch * (32 * 128 / 4), &dk_rope_val);
                         cutlass::arch::fence_view_async_tmem_load();
                         
                         if (is_valid) {
@@ -323,24 +325,29 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
         // Wait for all dQ accumulations to complete
         __syncthreads();
         
-        if (warp_idx == 0 && elect_one_sync()) {
-            // Copy dQ from TMEM to shared memory
-            Tensor sdQ = make_tensor(make_smem_ptr(plan.u.dQ_out.data()), SmemLayoutdQ{});
+        // 修复：使用 Warp 0 和 Warp 1 协作加载 dQ (B_H=64)
+        if (warpgroup_idx == 0 && warp_idx < 2) {
+            int my_row_offset = warp_idx * 32; // Warp 0 -> 0, Warp 1 -> 32
             
-            // Load dQ from TMEM
-            float2 dq_vals[D_Q / 64];
+            // Load dQ from TMEM (每个线程加载自己负责的行)
+            float2 dq_vals[D_Q / 32]; // 每个线程持有 D_Q/32 个 float2 (对应 D_Q 维)
+            // 修复：tmem_ld_32dp32bNx 加载 32 行，每列 128 字节
+            ku::tmem_ld_32dp32bNx<D_Q/32>(tmem_cols::dQ + my_row_offset * (128 / 4), dq_vals);
+            cutlass::arch::fence_view_async_tmem_load();
+            
+            // Convert to bf16 and store to shared memory
             CUTE_UNROLL
-            for (int row = 0; row < B_H; ++row) {
-                ku::tmem_ld_32dp32bNx<D_Q/32>(tmem_cols::dQ, dq_vals);
-                cutlass::arch::fence_view_async_tmem_load();
-                
-                // Convert to bf16 and store to shared memory
-                CUTE_UNROLL
-                for (int d = 0; d < D_Q / 64; ++d) {
-                    nv_bfloat162 dq_bf16 = __float22bfloat162_rn(dq_vals[d]);
-                    *(nv_bfloat162*)(plan.u.dQ_out.data() + row * D_Q + d * 2) = dq_bf16;
-                }
+            for (int d = 0; d < D_Q / 32; ++d) {
+                nv_bfloat162 dq_bf16 = __float22bfloat162_rn(dq_vals[d]);
+                int row = my_row_offset + lane_idx;
+                *(nv_bfloat162*)(plan.u.dQ_out.data() + row * D_Q + d * 2) = dq_bf16;
             }
+        }
+        
+        __syncthreads();
+        
+        if (warp_idx == 0 && elect_one_sync()) {
+            Tensor sdQ = make_tensor(make_smem_ptr(plan.u.dQ_out.data()), SmemLayoutdQ{});
             
             fence_view_async_shared();
             
