@@ -13,10 +13,11 @@ struct SparseAttnBwdParams {
     void* d_out;                // Output gradient [s_q, h_q, d_v]
     int* indices;               // Sparse indices [s_q, topk]
     float* lse;                 // Log-sum-exp from forward [s_q, h_q]
+    float* delta;               // Delta = rowsum(O * dO) [s_q, h_q] - precomputed
     
     // Output tensors
     void* d_q;                  // Query gradient [s_q, h_q, d_qk]
-    void* d_kv;                 // KV gradient [s_kv, h_kv, d_qk] (float32 for atomic add)
+    float* d_kv;                // KV gradient [s_kv, h_kv, d_qk] (float32 for atomic add)
     
     // Dimensions
     int s_q;                    // Query sequence length

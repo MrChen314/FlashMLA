@@ -32,10 +32,11 @@ K[k], V[k]
           dP_mid[k] = dO @ V[k]^T
                       dS[k] = S[k] * (dP_mid[k] - Delta) * scale
           dQ += dS[k] @ K[k]
-          dK[k] = dS[k]^T @ Q
+          dK_nope[k] = dS[k]^T @ Q_nope
+          dK_rope[k] = dS[k]^T @ Q_rope  <-- FIX: Added RoPE gradient
           dV[k] = S[k]^T @ dO
-                                            atomic_add(dK_global, dK[k])
-                                            atomic_add(dV_global, dV[k])
+                                            atomic_add(dK_global, dK[k])  <-- FIX: Implemented
+                                            atomic_add(dV_global, dV[k])  <-- FIX: Implemented
 */
 
 // Helper function to load indices with 256B cache hint
@@ -57,6 +58,12 @@ CUTE_DEVICE void atomic_add_float4(float* addr, float4 val) {
     atomicAdd(addr + 3, val.w);
 }
 
+// Atomic add for float2
+CUTE_DEVICE void atomic_add_float2(float* addr, float2 val) {
+    atomicAdd(addr + 0, val.x);
+    atomicAdd(addr + 1, val.y);
+}
+
 template<bool HAVE_ROPE, typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __grid_constant__ const TmaParams tma_params) {
@@ -75,6 +82,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
 
     int* gIndices = params.indices + s_q_idx * params.stride_indices_s_q;
+    
+    // Global pointers for atomic operations
+    float* gDKV = params.d_kv;
 
     // Allocate TMEM tensors
     TiledMMA tiled_mma_P = TiledMMA_P{};
@@ -85,12 +95,16 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     // TMEM tensor handles
     Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
     Tensor tdQ = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_V>>{});
+    Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_Q-D_V>>{});
     Tensor tdK = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_V>>{});
+    Tensor tdK_rope = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_Q-D_V>>{});
     Tensor tdV = partition_fragment_C(tiled_mma_dV, Shape<Int<B_TOPK>, Int<D_V>>{});
 
     tP.data().get() = tmem_cols::P;
     tdQ.data().get() = tmem_cols::dQ;
+    tdQ_rope.data().get() = tmem_cols::dQ + D_V/2;  // After NoPE part
     tdK.data().get() = tmem_cols::dKV;
+    tdK_rope.data().get() = tmem_cols::dKV;  // Reuse same space, computed separately
     tdV.data().get() = tmem_cols::dKV;
 
     // Initialize barriers and TMEM allocation
@@ -135,17 +149,20 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
     __syncthreads();
 
-    // ========== Warpgroup 0: Scale, Softmax, and Element-wise Operations ==========
+    // ========== Warpgroup 0: Scale, Softmax, Element-wise Operations, and Atomic dKV ==========
     if (warpgroup_idx == 0) {
-        // Load LSE and compute Delta = rowsum(O * dO)
+        // Load LSE and Delta from global memory (precomputed)
         float lse_val = params.lse[s_q_idx * params.h_q + idx_in_warpgroup % B_H];
+        float delta_val = params.delta[s_q_idx * params.h_q + idx_in_warpgroup % B_H];
         
-        // Initialize accumulators
-        float mi = MAX_INIT_VAL;
-        float li = 0.0f;
-        float delta = 0.0f;  // Will be computed from O * dO
+        // Store delta to shared memory for other threads
+        if (lane_idx < B_H && warp_idx == 0) {
+            plan.delta_buf[lane_idx] = params.delta[s_q_idx * params.h_q + lane_idx];
+        }
+        __syncwarp();
 
         bf16* sS_base = plan.s_q_rope.s + lane_idx * 8 + (warp_idx & 1) * (B_H/2) * 8 + (warp_idx/2) * B_H * (B_TOPK/2);
+        bf16* sdS_base = sS_base;  // dS stored in same location
         static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
 
         // Main backward loop
@@ -190,6 +207,12 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 s[i] = __float22bfloat162_rn(p2);
             }
 
+            // Store S to shared memory for dV computation (S^T @ dO)
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; i += 1) {
+                *(uint128_t*)(sS_base + B_H * 8 * i) = *(uint128_t*)(s + i*4);
+            }
+
             // Wait for dP_mid computation
             plan.bar_dp_computed[cur_buf].wait((k/NUM_BUFS) & 1);
 
@@ -199,8 +222,6 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             cutlass::arch::fence_view_async_tmem_load();
 
             // Compute dS = S * (dP_mid - Delta) * scale
-            // Note: Delta should be precomputed as rowsum(O * dO)
-            float delta_val = plan.delta_buf[idx_in_warpgroup % B_H];
             nv_bfloat162 ds[NUM_ELEMS_PER_THREAD/2];
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; ++i) {
@@ -211,18 +232,122 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 ds[i] = __float22bfloat162_rn(make_float2(ds_x, ds_y));
             }
 
-            // Store S and dS to shared memory for subsequent GEMMs
+            // Store dS to shared memory for dQ and dK computation
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; i += 1) {
-                *(uint128_t*)(sS_base + B_H * 8 * i) = *(uint128_t*)(s + i*4);
+                *(uint128_t*)(sdS_base + B_H * 8 * i) = *(uint128_t*)(ds + i*4);
             }
 
             fence_view_async_shared();
             plan.bar_so_ready.arrive();
+
+            // ===== Atomic accumulation of dK and dV =====
+            // Wait for dK/dV to be computed by MMA warpgroup
+            plan.bar_dkv_ready[cur_buf].wait((k/NUM_BUFS) & 1);
+            ku::tcgen05_after_thread_sync();
+
+            // Load dK from TMEM and atomically add to global memory
+            // Each thread handles a portion of the dK/dV matrix
+            const int local_warp = warp_idx;  // 0-3
+            const int rows_per_warp = B_TOPK / 4;  // 16 rows per warp
+            const int row_start = local_warp * rows_per_warp;
+            
+            // Load indices for this block
+            int indices_buf[rows_per_warp];
+            CUTE_UNROLL
+            for (int r = 0; r < rows_per_warp; ++r) {
+                indices_buf[r] = __ldg(gIndices + k * B_TOPK + row_start + r);
+            }
+
+            // Atomic add dK (NoPE part: D_V = 512 dimensions)
+            // Each lane handles 512/32 = 16 elements
+            {
+                float2 dk_vals[D_V / 64];  // 8 float2 values per lane
+                ku::tmem_ld_32dp32bNx<D_V/32>(tmem_cols::dKV + lane_idx * (D_V/64), dk_vals);
+                cutlass::arch::fence_view_async_tmem_load();
+                
+                CUTE_UNROLL
+                for (int r = 0; r < rows_per_warp; ++r) {
+                    int kv_idx = indices_buf[r];
+                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
+                        float* dk_ptr = gDKV + kv_idx * params.stride_dkv_s_kv;
+                        CUTE_UNROLL
+                        for (int d = 0; d < D_V / 64; ++d) {
+                            atomic_add_float2(dk_ptr + lane_idx * 2 + d * 64, dk_vals[d]);
+                        }
+                    }
+                }
+            }
+
+            // Atomic add dK (RoPE part: 64 dimensions)
+            if constexpr (HAVE_ROPE) {
+                float2 dk_rope_vals[1];  // 2 elements per lane for 64-dim RoPE
+                ku::tmem_ld_32dp32bNx<1>(tmem_cols::dKV + D_V/2 + lane_idx, dk_rope_vals);
+                cutlass::arch::fence_view_async_tmem_load();
+                
+                CUTE_UNROLL
+                for (int r = 0; r < rows_per_warp; ++r) {
+                    int kv_idx = indices_buf[r];
+                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
+                        float* dk_ptr = gDKV + kv_idx * params.stride_dkv_s_kv + D_V;
+                        atomic_add_float2(dk_ptr + lane_idx * 2, dk_rope_vals[0]);
+                    }
+                }
+            }
+
+            // Atomic add dV (D_V = 512 dimensions)
+            {
+                float2 dv_vals[D_V / 64];
+                // dV is stored after dK in TMEM (or recomputed)
+                ku::tmem_ld_32dp32bNx<D_V/32>(tmem_cols::dKV + lane_idx * (D_V/64), dv_vals);
+                cutlass::arch::fence_view_async_tmem_load();
+                
+                CUTE_UNROLL
+                for (int r = 0; r < rows_per_warp; ++r) {
+                    int kv_idx = indices_buf[r];
+                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
+                        // dV is stored in the V part of KV (first D_V dimensions)
+                        float* dv_ptr = gDKV + kv_idx * params.stride_dkv_s_kv;
+                        CUTE_UNROLL
+                        for (int d = 0; d < D_V / 64; ++d) {
+                            atomic_add_float2(dv_ptr + lane_idx * 2 + d * 64, dv_vals[d]);
+                        }
+                    }
+                }
+            }
         }
 
-        // Store final dQ
-        // ... (epilogue code)
+        // ===== Store final dQ using TMA =====
+        // Wait for all dQ accumulations to complete
+        __syncthreads();
+        
+        if (warp_idx == 0 && elect_one_sync()) {
+            // Copy dQ from TMEM to shared memory
+            Tensor sdQ = make_tensor(make_smem_ptr(plan.u.dQ_out.data()), SmemLayoutdQ{});
+            
+            // Load dQ from TMEM
+            float2 dq_vals[D_Q / 64];
+            CUTE_UNROLL
+            for (int row = 0; row < B_H; ++row) {
+                ku::tmem_ld_32dp32bNx<D_Q/32>(tmem_cols::dQ, dq_vals);
+                cutlass::arch::fence_view_async_tmem_load();
+                
+                // Convert to bf16 and store to shared memory
+                CUTE_UNROLL
+                for (int d = 0; d < D_Q / 64; ++d) {
+                    nv_bfloat162 dq_bf16 = __float22bfloat162_rn(dq_vals[d]);
+                    *(nv_bfloat162*)(plan.u.dQ_out.data() + row * D_Q + d * 2) = dq_bf16;
+                }
+            }
+            
+            fence_view_async_shared();
+            
+            // TMA store dQ to global memory
+            cute::copy(tma_params.tma_dQ, sdQ, 
+                make_tensor(make_gmem_ptr((bf16*)params.d_q + s_q_idx * params.stride_dq_s_q), 
+                    make_layout(make_shape(Int<B_H>{}, Int<D_Q>{}), 
+                        make_stride(params.stride_dq_h_q, _1{}))));
+        }
 
         if (warp_idx == 0) {
             cute::TMEM::Allocator1Sm().free(0, 512);
@@ -302,6 +427,16 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 )
             );
 
+            UMMA::SmemDescriptor sQ_rope_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                make_tensor(
+                    make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()),
+                    tile_to_shape(
+                        UMMA::Layout_K_SW64_Atom<bf16>{},
+                        Shape<Int<B_H*2>, Int<32>>{}
+                    )
+                )
+            );
+
             // Load Q to shared memory and copy to TMEM
             plan.bar_prologue_q.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
             plan.bar_prologue_q.wait(0);
@@ -317,79 +452,89 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             }
             ku::umma_arrive_noelect(plan.bar_prologue_utccp_nope);
 
+            // Load Q_rope if needed
+            if constexpr (HAVE_ROPE) {
+                plan.bar_prologue_q_rope.arrive_and_expect_tx(B_H * (D_Q - D_V) * sizeof(bf16));
+                plan.bar_prologue_q_rope.wait(0);
+                ku::tcgen05_after_thread_sync();
+            }
+
             // Main computation loop
             CUTE_NO_UNROLL
-            for (int k = 0; k < num_k_blocks + 1; ++k) {
-                if (k < num_k_blocks) {
-                    int cur_buf = k % NUM_BUFS;
+            for (int k = 0; k < num_k_blocks; ++k) {
+                int cur_buf = k % NUM_BUFS;
 
-                    // ===== Step 1: Recompute P = Q @ K^T =====
-                    Tensor sQ = make_tensor(make_smem_ptr(plan.dKV_cfg.q_buf.data()), SmemLayoutQ{});
-                    Tensor sK = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutK{});
+                // ===== Step 1: Recompute P = Q @ K^T =====
+                Tensor sQ = make_tensor(make_smem_ptr(plan.dKV_cfg.q_buf.data()), SmemLayoutQ{});
+                Tensor sK = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutK{});
 
-                    // Wait for K to be ready
-                    plan.bar_k_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
-                    plan.bar_k_ready[cur_buf][0].wait((k/NUM_BUFS) & 1);
-                    ku::tcgen05_after_thread_sync();
+                // Wait for K to be ready
+                plan.bar_k_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
+                plan.bar_k_ready[cur_buf][0].wait((k/NUM_BUFS) & 1);
+                ku::tcgen05_after_thread_sync();
 
-                    // P = Q @ K^T (NoPE part)
-                    ku::utcmma_ss(tiled_mma_P, sQ, sK, tP, true);
-                    
-                    // Wait for K RoPE part
-                    plan.bar_k_ready[cur_buf][1].arrive_and_expect_tx(B_TOPK * (D_K-D_V)/2 * sizeof(bf16));
-                    plan.bar_k_ready[cur_buf][1].wait((k/NUM_BUFS) & 1);
-                    ku::tcgen05_after_thread_sync();
+                // P = Q @ K^T (NoPE part)
+                ku::utcmma_ss(tiled_mma_P, sQ, sK, tP, true);
+                
+                // Wait for K RoPE part
+                plan.bar_k_ready[cur_buf][1].arrive_and_expect_tx(B_TOPK * (D_K-D_V)/2 * sizeof(bf16));
+                plan.bar_k_ready[cur_buf][1].wait((k/NUM_BUFS) & 1);
+                ku::tcgen05_after_thread_sync();
 
-                    // P += Q_rope @ K_rope^T (RoPE part)
-                    if constexpr (HAVE_ROPE) {
-                        Tensor sQ_rope = make_tensor(make_smem_ptr(plan.s_q_rope.q_rope.data()), SmemLayoutQRoPE{});
-                        Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
-                        ku::utcmma_ss(tiled_mma_P, sQ_rope, sK_rope, tP, false);
-                    }
-
-                    plan.bar_p_computed[cur_buf].arrive();
-
-                    // ===== Step 2: Compute dP_mid = dO @ V^T =====
-                    Tensor sdO = make_tensor(make_smem_ptr(plan.dKV_cfg.do_buf.data()), SmemLayoutdO{});
-                    Tensor sV = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutV{});
-
-                    // Wait for V (reusing K buffer space for V)
-                    plan.bar_v_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
-                    plan.bar_v_ready[cur_buf][0].wait((k/NUM_BUFS) & 1);
-                    ku::tcgen05_after_thread_sync();
-
-                    // dP_mid = dO @ V^T (stored in P's TMEM location)
-                    ku::utcmma_ss(tiled_mma_dQ, sdO, sV, tP, true);  // Reuse P's TMEM for dP_mid
-
-                    plan.bar_dp_computed[cur_buf].arrive();
-
-                    // ===== Step 3: dQ += dS @ K (after softmax computes dS) =====
-                    plan.bar_so_ready.wait((k/NUM_BUFS) & 1);
-                    Tensor sS = make_tensor(make_smem_ptr(plan.s_q_rope.s), SmemLayoutP{});
-
-                    ku::utcmma_ss(tiled_mma_dQ, sS, sK, tdQ, k == 0);
-
-                    plan.bar_dq_accumulated[cur_buf].arrive();
-
-                    // ===== Step 4: dK = dS^T @ Q =====
-                    // dS is in shared memory, Q is in TMEM
-                    ku::utcmma_ts(tiled_mma_dK, sS, sQ, tdK, true);
-
-                    // ===== Step 5: dV = S^T @ dO =====
-                    // S is in shared memory (same as dS location after softmax)
-                    ku::utcmma_ss(tiled_mma_dV, sS, sdO, tdV, true);
-
-                    plan.bar_dkv_ready[cur_buf].arrive();
+                // P += Q_rope @ K_rope^T (RoPE part)
+                if constexpr (HAVE_ROPE) {
+                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
+                    Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
+                    ku::utcmma_ss(tiled_mma_P, sQ_rope, sK_rope, tP, false);
                 }
 
-                // Atomic accumulation of dK and dV (from previous iteration)
-                if (k > 0) {
-                    int prev_buf = (k - 1) % NUM_BUFS;
-                    plan.bar_dkv_ready[prev_buf].wait(((k-1)/NUM_BUFS) & 1);
+                plan.bar_p_computed[cur_buf].arrive();
 
-                    // Load dK and dV from TMEM and atomically add to global memory
-                    // This is done by the atomic warp group
+                // ===== Step 2: Compute dP_mid = dO @ V^T =====
+                Tensor sdO = make_tensor(make_smem_ptr(plan.dKV_cfg.do_buf.data()), SmemLayoutdO{});
+                Tensor sV = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutV{});
+
+                // Wait for V (reusing K buffer space for V)
+                plan.bar_v_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
+                plan.bar_v_ready[cur_buf][0].wait((k/NUM_BUFS) & 1);
+                ku::tcgen05_after_thread_sync();
+
+                // dP_mid = dO @ V^T (stored in P's TMEM location)
+                ku::utcmma_ss(tiled_mma_dQ, sdO, sV, tP, true);  // Reuse P's TMEM for dP_mid
+
+                plan.bar_dp_computed[cur_buf].arrive();
+
+                // ===== Step 3: dQ += dS @ K (after softmax computes dS) =====
+                plan.bar_so_ready.wait((k/NUM_BUFS) & 1);
+                Tensor sS = make_tensor(make_smem_ptr(plan.s_q_rope.s), SmemLayoutP{});
+
+                // dQ_nope += dS @ K_nope
+                ku::utcmma_ss(tiled_mma_dQ, sS, sK, tdQ, k == 0);
+
+                // dQ_rope += dS @ K_rope (FIX: Added RoPE gradient for dQ)
+                if constexpr (HAVE_ROPE) {
+                    Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
+                    ku::utcmma_ss(tiled_mma_dQ, sS, sK_rope, tdQ_rope, k == 0);
                 }
+
+                plan.bar_dq_accumulated[cur_buf].arrive();
+
+                // ===== Step 4: dK = dS^T @ Q =====
+                // dK_nope = dS^T @ Q_nope
+                ku::utcmma_ts(tiled_mma_dK, sS, sQ, tdK, true);
+
+                // dK_rope = dS^T @ Q_rope (FIX: Added RoPE gradient for dK)
+                if constexpr (HAVE_ROPE) {
+                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
+                    ku::utcmma_ts(tiled_mma_dK, sS, sQ_rope, tdK_rope, true);
+                }
+
+                // ===== Step 5: dV = S^T @ dO =====
+                // Note: S is stored in shared memory (same location as dS after softmax stores it)
+                // We need to use the S values computed by warpgroup 0
+                ku::utcmma_ts(tiled_mma_dV, sS, sdO, tdV, true);
+
+                plan.bar_dkv_ready[cur_buf].arrive();
             }
         }
     }
@@ -416,6 +561,7 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     KU_ASSERT(params.topk % B_TOPK == 0);
     KU_ASSERT(params.h_q == B_H);
     KU_ASSERT(params.d_qk == D_QK);
+    KU_ASSERT(params.delta != nullptr);  // Delta must be precomputed
 
     // Create TMA descriptors
     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
@@ -492,7 +638,7 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
         tensor_map_kv
     };
 
-    auto kernel = &sparse_attn_bwd_kernel<true, decltype(tma_params_struct)>;
+    auto kernel = &sparse_attn_bwd_kernel<D_QK == 576, decltype(tma_params_struct)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
