@@ -2,8 +2,85 @@ from typing import Optional, Tuple
 import dataclasses
 
 import torch
+import tilelang
+import tilelang.language as T
 
 import flash_mla.cuda as flash_mla_cuda
+
+
+# ==================== Tilelang Preprocess Kernel ====================
+@tilelang.jit(out_idx=[-1])
+def _preprocess_delta_kernel(
+    B,
+    S,
+    H,
+    D,
+    block_ND=32,
+    num_stages=5,
+    dtype=T.bfloat16,
+    accum_dtype=T.float32,
+):
+    """
+    计算 Delta = rowsum(O * dO)
+    
+    Args:
+        B: batch size
+        S: sequence length (s_q)
+        H: number of heads (h_q)
+        D: value dimension (d_v)
+    """
+    assert dtype == T.bfloat16
+    assert accum_dtype == T.float32
+    shape = [B, S, H, D]
+
+    @T.prim_func
+    def preprocess_kernel(
+        O: T.Tensor(shape, dtype),
+        dO: T.Tensor(shape, dtype),
+        Delta: T.Tensor([B, S, H], accum_dtype),
+    ):
+        with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
+            o = T.alloc_fragment([block_ND, block_ND], accum_dtype)
+            do = T.alloc_fragment([block_ND, block_ND], accum_dtype)
+            delta = T.alloc_fragment([block_ND], accum_dtype)
+            acc = T.alloc_fragment([block_ND, block_ND], accum_dtype)
+            T.clear(acc)
+            for k in T.Pipelined(T.ceildiv(D, block_ND), num_stages=num_stages):
+                T.copy(O[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], o)
+                T.copy(dO[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], do)
+                for i, j in T.Parallel(block_ND, block_ND):
+                    acc[i, j] += o[i, j] * do[i, j]
+            T.reduce_sum(acc, delta, 1)
+            T.copy(delta, Delta[bz, by * block_ND : (by + 1) * block_ND, bx])
+
+    return preprocess_kernel
+
+
+def _compute_delta(out: torch.Tensor, d_out: torch.Tensor) -> torch.Tensor:
+    """
+    使用 tilelang 计算 Delta = rowsum(O * dO)
+    
+    Args:
+        out: [s_q, h_q, d_v], bfloat16，前向输出
+        d_out: [s_q, h_q, d_v], bfloat16，输出梯度
+    
+    Returns:
+        delta: [s_q, h_q], float32
+    """
+    s_q, h_q, d_v = out.shape
+    
+    # tilelang kernel 期望输入形状为 [B, S, H, D]
+    # 我们的输入是 [s_q, h_q, d_v]，需要添加 batch 维度
+    out_4d = out.unsqueeze(0)  # [1, s_q, h_q, d_v]
+    d_out_4d = d_out.unsqueeze(0)  # [1, s_q, h_q, d_v]
+    
+    # 调用 tilelang preprocess kernel
+    delta_4d = _preprocess_delta_kernel(1, s_q, h_q, d_v)(out_4d, d_out_4d)
+    
+    # 移除 batch 维度：[1, s_q, h_q] -> [s_q, h_q]
+    delta = delta_4d.squeeze(0)
+    
+    return delta
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -216,6 +293,46 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length
     )
     return results
+
+
+def flash_mla_sparse_backward(
+    d_out: torch.Tensor,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    indices: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    稀疏注意力反向传播内核
+
+    Args:
+        d_out: [s_q, h_q, d_v], bfloat16，输出梯度
+        q: [s_q, h_q, d_qk], bfloat16，Query 张量
+        kv: [s_kv, h_kv, d_qk], bfloat16，KV 张量
+        out: [s_q, h_q, d_v], bfloat16，前向输出
+        indices: [s_q, h_kv, topk], int32，稀疏索引
+        lse: [s_q, h_q], float32，前向的 log-sum-exp
+        sm_scale: float，softmax 缩放因子
+        d_v: Value 向量维度，只能是 512
+        topk_length: 可选，[s_q], int32，每个 query 的 topk 长度
+
+    Returns:
+        (d_q, d_kv)
+        - d_q: [s_q, h_q, d_qk], bfloat16，Query 梯度
+        - d_kv: [s_kv, h_kv, d_qk], float32，KV 梯度（使用 float32 进行原子累加）
+    """
+    # 使用 tilelang 计算 delta = rowsum(O * dO)
+    delta = _compute_delta(out, d_out)
+    
+    # 调用 C++ 反向传播 kernel，传入预计算的 delta
+    d_q, d_kv = flash_mla_cuda.sparse_prefill_bwd(
+        d_out, q, kv, out, indices, lse, delta, sm_scale, d_v, topk_length
+    )
+    return d_q, d_kv
 
 
 def _flash_attn_varlen_forward(

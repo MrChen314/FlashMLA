@@ -167,6 +167,37 @@ struct SparseAttnFwdParams {
     cudaStream_t stream;
 };
 
+// 稀疏注意力反向传播参数
+struct SparseAttnBwdParams {
+    int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    float sm_scale, sm_scale_div_log2;
+
+    // 输入张量
+    cutlass::bfloat16_t* __restrict__ q;     // [s_q, h_q, d_qk]
+    cutlass::bfloat16_t* __restrict__ kv;    // [s_kv, h_kv, d_qk]
+    cutlass::bfloat16_t* __restrict__ out;   // [s_q, h_q, d_v]
+    cutlass::bfloat16_t* __restrict__ d_out; // [s_q, h_q, d_v]
+    int* __restrict__ indices;               // [s_q, h_kv, topk]
+    float* __restrict__ lse;                 // [s_q, h_q]
+    float* __restrict__ delta;               // [s_q, h_q]，Delta = rowsum(O * dO)，预计算
+
+    // 输出张量
+    cutlass::bfloat16_t* __restrict__ d_q;   // [s_q, h_q, d_qk]
+    float* __restrict__ d_kv;                // [s_kv, h_kv, d_qk] (float32 用于原子累加)
+
+    // Strides
+    int stride_q_s_q, stride_q_h_q;
+    int stride_kv_s_kv, stride_kv_h_kv;
+    int stride_out_s_q, stride_out_h_q;
+    int stride_dout_s_q, stride_dout_h_q;
+    int stride_dq_s_q, stride_dq_h_q;
+    int stride_dkv_s_kv, stride_dkv_h_kv;
+    int stride_indices_s_q, stride_indices_h_kv;
+
+    int* __restrict__ topk_length;  // 可选，[s_q]，可为 nullptr
+    cudaStream_t stream;
+};
+
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
 enum class SparseAttnFwdMode {
     Prefill,            // Normal prefill mode
