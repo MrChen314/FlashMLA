@@ -181,6 +181,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_dp_computed[NUM_BUFS];     // dP computation done
     transac_bar_t bar_dq_accumulated[NUM_BUFS];  // dQ accumulation done
     transac_bar_t bar_dkv_ready[NUM_BUFS];       // dK/dV ready for atomic
+    transac_bar_t bar_dkv_accum_done[NUM_BUFS];  // dK/dV atomic accumulation done
     
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     transac_bar_t bar_p_free;
@@ -207,19 +208,23 @@ using TiledMMA_dP = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
-// dQ += dS @ K
+// SM100 MMA N维度只支持 64/128/256，D_V=512 需要分批处理
+constexpr int MMA_N_DIM = 256;  // 使用支持的最大N维度
+constexpr int DV_NUM_BATCHES = D_V / MMA_N_DIM;  // 512/256 = 2批
+
+// dQ += dS @ K (分批处理: K 的 D_V 维度拆分为 2 x 256)
 using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, D_V, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, MMA_N_DIM, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
-// dK = dS^T @ Q
+// dK = dS^T @ Q (分批处理: Q 的 D_V 维度拆分为 2 x 256)
 using TiledMMA_dK = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_V, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, MMA_N_DIM, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
-// dV = P^T @ dO
+// dV = P^T @ dO (分批处理: dO 的 D_V 维度拆分为 2 x 256)
 using TiledMMA_dV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_V, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, MMA_N_DIM, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 // Named barriers for synchronization

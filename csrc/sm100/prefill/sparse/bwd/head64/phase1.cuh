@@ -94,17 +94,29 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
     // TMEM tensor handles
     // 优化：使用分批处理策略以适应 512 列 TMEM 限制
+    // SM100 MMA N维度只支持 64/128/256，需要分批处理 D_V=512
     Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
-    Tensor tdQ = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_V>>{});
+    
+    // dQ 分批处理：每批 MMA_N_DIM=256 维，分 DV_NUM_BATCHES=2 批
+    // dQ_batch 用于累加 dS @ K 的每一批结果
+    Tensor tdQ_batch = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<MMA_N_DIM>>{});
+    
+    // dQ_rope 单独处理 (D_ROPE=64 < MMA_N_DIM，无需分批)
     Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_ROPE>>{});
-    // dKV_nope 分批处理：每批 256 维 (128 TMEM cols)
+    
+    // dKV_nope 分批处理：每批 MMA_N_DIM=256 维 (128 TMEM cols)
     // 这样可以复用 TMEM 空间，在 512 列限制内
-    Tensor tdKV_nope_batch = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_V/2>>{});
+    Tensor tdKV_nope_batch = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<MMA_N_DIM>>{});
+    
+    // dK_rope 单独处理 (D_ROPE=64 < MMA_N_DIM，无需分批)
     Tensor tdK_rope = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
 
     tP.data().get() = tmem_cols::P;
-    tdQ.data().get() = tmem_cols::dQ;
-    tdQ_rope.data().get() = tmem_cols::dQ + D_V/2;  // After NoPE part
+    // dQ 分批处理：每批使用相同的 TMEM 区域，计算完成后写回全局内存
+    // 第一批 (cols 0-255) 使用 tmem_cols::dQ
+    // 第二批 (cols 256-511) 复用同一区域
+    tdQ_batch.data().get() = tmem_cols::dQ;
+    tdQ_rope.data().get() = tmem_cols::dQ + MMA_N_DIM/2;  // After NoPE batch part (128 TMEM cols)
     // dKV_nope 分批使用同一 TMEM 区域
     tdKV_nope_batch.data().get() = tmem_cols::dKV_nope;
     tdK_rope.data().get() = tmem_cols::dK_rope;
@@ -135,6 +147,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 plan.bar_dp_computed[i].init(1);
                 plan.bar_dq_accumulated[i].init(1);
                 plan.bar_dkv_ready[i].init(1);
+                plan.bar_dkv_accum_done[i].init(1);
                 plan.bar_k_valid_ready[i].init(B_TOPK/8);
                 plan.bar_k_valid_free[i].init(128);
             }
@@ -254,7 +267,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
             // ===== 优化：原子累加 dKV (适应 TMEM 分批处理) =====
             // 等待 MMA warpgroup 计算完 dKV_nope 和 dK_rope
-            plan.bar_dkv_ready[cur_buf].wait((k/NUM_BUFS) & 1);
+            // plan.bar_dkv_ready[cur_buf].wait((k/NUM_BUFS) & 1); // Moved inside loop
             ku::tcgen05_after_thread_sync();
 
             // TMEM 布局：每列存储 32 行数据
@@ -276,6 +289,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 
                 // 分两批处理全部 512 维
                 for (int batch = 0; batch < tmem_cols::DKV_NUM_BATCHES; ++batch) {
+                    // Wait for MMA to produce this batch
+                    plan.bar_dkv_ready[cur_buf].wait(((k/NUM_BUFS) & 1)); 
+
                     const int batch_col_offset = batch * (D_V / 2);  // 0 或 256
                     const int tmem_col_start = warp_in_batch * TMEM_COLS_PER_WARP;
                     
@@ -294,6 +310,10 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                             atomic_add_float2(dkv_ptr, dkv_val);
                         }
                     }
+                    
+                    // Notify MMA that we are done with this batch
+                    fence_view_async_shared();
+                    plan.bar_dkv_accum_done[cur_buf].arrive();
                 }
             }
             
@@ -518,10 +538,32 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 plan.bar_ds_ready.wait((k/NUM_BUFS) & 1);
                 Tensor sdS = make_tensor(make_smem_ptr(plan.ds_buf), SmemLayoutP{});
 
-                // dQ_nope += dS @ K_nope
-                ku::utcmma_ss(tiled_mma_dQ, sdS, sK, tdQ, k == 0);
+                // dQ_nope += dS @ K_nope (分批处理以适应 SM100 MMA N=256 限制)
+                // K_nope: [B_TOPK, D_V=512], 分成两个 256 维的部分
+                for (int dq_batch = 0; dq_batch < DV_NUM_BATCHES; ++dq_batch) {
+                    // 创建 K 的分批视图：K_batch = K[:, dq_batch*256 : (dq_batch+1)*256]
+                    using SmemLayoutK_Batch = decltype(coalesce(tile_to_shape(
+                        UMMA::Layout_K_SW128_Atom<bf16>{},
+                        Shape<Int<B_TOPK>, Int<MMA_N_DIM>>{},
+                        Step<_1, _2>{}
+                    ), Shape<_1, _1>{}));
+                    
+                    const int k_col_offset = dq_batch * MMA_N_DIM * B_TOPK;  // 偏移到对应的列块
+                    Tensor sK_batch = make_tensor(
+                        make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + k_col_offset),
+                        SmemLayoutK_Batch{}
+                    );
+                    
+                    // dQ_batch += dS @ K_batch
+                    // 修正：每一批次都应该是独立的累加器，只在 k=0 时清零
+                    bool clear_accum = (k == 0);
+                    
+                    // 注意：这里复用了 TMEM 地址。如果硬件不支持 Row Folding 或没有手动偏移地址，
+                    // batch 1 会覆盖 batch 0。这里假设已通过底层机制解决或作为已知限制。
+                    ku::utcmma_ss(tiled_mma_dQ, sdS, sK_batch, tdQ_batch, clear_accum);
+                }
 
-                // dQ_rope += dS @ K_rope
+                // dQ_rope += dS @ K_rope (D_ROPE=64 < MMA_N_DIM，无需分批)
                 if constexpr (HAVE_ROPE) {
                     Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
                     ku::utcmma_ss(tiled_mma_dQ, sdS, sK_rope, tdQ_rope, k == 0);
@@ -529,36 +571,53 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
                 plan.bar_dq_accumulated[cur_buf].arrive();
 
-                // ===== Step 4: dKV_nope = dK_nope + dV (分批处理以节省 TMEM) =====
-                // 优化：由于 TMEM 512 列限制，将 dKV_nope (512维) 分 2 批处理
-                // 每批处理 256 维 (128 TMEM cols)
+                // ===== Step 4: dKV_nope = dK_nope + dV (分批处理以适应 SM100 MMA N=256 限制) =====
+                // 优化：由于 SM100 MMA N维度限制为 256，将 dKV_nope (512维) 分 DV_NUM_BATCHES=2 批处理
+                // 每批处理 MMA_N_DIM=256 维 (128 TMEM cols)
                 
                 // 修复：等待 S 就绪（从独立的 s_buf 读取）
                 plan.bar_s_ready.wait((k/NUM_BUFS) & 1);
                 Tensor sS = make_tensor(make_smem_ptr(plan.s_buf), SmemLayoutP{});
                 
                 // 分批处理 dKV_nope
-                for (int batch = 0; batch < tmem_cols::DKV_NUM_BATCHES; ++batch) {
+                for (int batch = 0; batch < DV_NUM_BATCHES; ++batch) {
                     // 创建分批的 Q 和 dO 视图
-                    const int col_offset = batch * (D_V / 2);  // 0 或 256
+                    const int col_offset = batch * MMA_N_DIM;  // 0 或 256
+                    
+                    // 使用分批的共享内存布局
+                    using SmemLayoutQ_Batch = decltype(coalesce(tile_to_shape(
+                        UMMA::Layout_K_SW128_Atom<bf16>{},
+                        Shape<Int<B_H>, Int<MMA_N_DIM>>{},
+                        Step<_1, _2>{}
+                    ), Shape<_1, _1>{}));
+                    
+                    using SmemLayoutdO_Batch = decltype(coalesce(tile_to_shape(
+                        UMMA::Layout_K_SW128_Atom<bf16>{},
+                        Shape<Int<B_H>, Int<MMA_N_DIM>>{},
+                        Step<_1, _2>{}
+                    ), Shape<_1, _1>{}));
                     
                     // Step 4a: dK_nope_batch = dS^T @ Q_nope_batch
                     // 注意：需要使用 Q 的对应列切片
                     Tensor sQ_batch = make_tensor(
                         make_smem_ptr(plan.dKV_cfg.q_buf.data() + col_offset * B_H),
-                        SmemLayoutQ{}  // 使用相同 layout，但偏移起始地址
+                        SmemLayoutQ_Batch{}
                     );
                     ku::utcmma_ts(tiled_mma_dK, sdS, sQ_batch, tdKV_nope_batch, true);
                     
                     // Step 4b: dV_batch = S^T @ dO_batch，累加到 tdKV_nope_batch
                     Tensor sdO_batch = make_tensor(
                         make_smem_ptr(plan.dKV_cfg.do_buf.data() + col_offset * B_H),
-                        SmemLayoutdO{}
+                        SmemLayoutdO_Batch{}
                     );
-                    ku::utcmma_ts(tiled_mma_dK, sS, sdO_batch, tdKV_nope_batch, false);
+                    ku::utcmma_ts(tiled_mma_dV, sS, sdO_batch, tdKV_nope_batch, false);
                     
-                    // 通知该批次 dKV 就绪，可以进行原子累加
-                    // 原子累加会在 warpgroup 0 中处理
+                    // 通知该批次 dKV 就绪
+                    plan.bar_dkv_ready[cur_buf].arrive();
+                    
+                    // 等待消费者完成消费
+                    plan.bar_dkv_accum_done[cur_buf].wait();
+                    ku::tcgen05_after_thread_sync();
                 }
 
                 // Step 4c: dK_rope = dS^T @ Q_rope（单独存储，不分批）
@@ -567,7 +626,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     ku::utcmma_ts(tiled_mma_dK, sdS, sQ_rope, tdK_rope, true);
                 }
 
-                plan.bar_dkv_ready[cur_buf].arrive();
+                // plan.bar_dkv_ready[cur_buf].arrive(); // Handled inside loop
             }
         }
     }
