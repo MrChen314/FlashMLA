@@ -411,7 +411,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 }
 
                 // Load K and V using TMA gather
-                bf16* sK_base = plan.dQ_cfg.k_buf[cur_buf].data() + warp_idx_local * 4 * 64;
+                bf16* sK_base = plan.u.dQ_cfg.k_buf[cur_buf].data() + warp_idx_local * 4 * 64;
 
                 auto load_kv_part = [&](int part_idx) {
                     CUTE_UNROLL
@@ -448,7 +448,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             // S -> T copy for Q (similar to forward)
             UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                 make_tensor(
-                    make_smem_ptr(plan.dKV_cfg.q_buf.data()),
+                    make_smem_ptr(plan.u.dKV_cfg.q_buf.data()),
                     tile_to_shape(
                         UMMA::Layout_K_SW128_Atom<bf16>{},
                         Shape<Int<B_H*2>, Int<64>>{}
@@ -458,7 +458,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
             UMMA::SmemDescriptor sQ_rope_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                 make_tensor(
-                    make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()),
+                    make_smem_ptr(plan.u.dKV_cfg.q_rope_buf.data()),
                     tile_to_shape(
                         UMMA::Layout_K_SW64_Atom<bf16>{},
                         Shape<Int<B_H*2>, Int<32>>{}
@@ -494,8 +494,8 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 int cur_buf = k % NUM_BUFS;
 
                 // ===== Step 1: Recompute P = Q @ K^T =====
-                Tensor sQ = make_tensor(make_smem_ptr(plan.dKV_cfg.q_buf.data()), SmemLayoutQ{});
-                Tensor sK = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutK{});
+                Tensor sQ = make_tensor(make_smem_ptr(plan.u.dKV_cfg.q_buf.data()), SmemLayoutQ{});
+                Tensor sK = make_tensor(make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutK{});
 
                 // Wait for K to be ready
                 plan.bar_k_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
@@ -512,16 +512,16 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
                 // P += Q_rope @ K_rope^T (RoPE part)
                 if constexpr (HAVE_ROPE) {
-                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
-                    Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
+                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.u.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
+                    Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
                     ku::utcmma_ss(tiled_mma_P, sQ_rope, sK_rope, tP, false);
                 }
 
                 plan.bar_p_computed[cur_buf].arrive();
 
                 // ===== Step 2: Compute dP_mid = dO @ V^T =====
-                Tensor sdO = make_tensor(make_smem_ptr(plan.dKV_cfg.do_buf.data()), SmemLayoutdO{});
-                Tensor sV = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutV{});
+                Tensor sdO = make_tensor(make_smem_ptr(plan.u.dKV_cfg.do_buf.data()), SmemLayoutdO{});
+                Tensor sV = make_tensor(make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutV{});
 
                 // Wait for V (reusing K buffer space for V)
                 plan.bar_v_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
@@ -550,7 +550,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     
                     const int k_col_offset = dq_batch * MMA_N_DIM * B_TOPK;  // 偏移到对应的列块
                     Tensor sK_batch = make_tensor(
-                        make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + k_col_offset),
+                        make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data() + k_col_offset),
                         SmemLayoutK_Batch{}
                     );
                     
@@ -565,7 +565,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
                 // dQ_rope += dS @ K_rope (D_ROPE=64 < MMA_N_DIM，无需分批)
                 if constexpr (HAVE_ROPE) {
-                    Tensor sK_rope = make_tensor(make_smem_ptr(plan.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
+                    Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data() + D_V * B_TOPK), SmemLayoutKRoPE{});
                     ku::utcmma_ss(tiled_mma_dQ, sdS, sK_rope, tdQ_rope, k == 0);
                 }
 
@@ -600,14 +600,14 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     // Step 4a: dK_nope_batch = dS^T @ Q_nope_batch
                     // 注意：需要使用 Q 的对应列切片
                     Tensor sQ_batch = make_tensor(
-                        make_smem_ptr(plan.dKV_cfg.q_buf.data() + col_offset * B_H),
+                        make_smem_ptr(plan.u.dKV_cfg.q_buf.data() + col_offset * B_H),
                         SmemLayoutQ_Batch{}
                     );
                     ku::utcmma_ts(tiled_mma_dK, sdS, sQ_batch, tdKV_nope_batch, true);
                     
                     // Step 4b: dV_batch = S^T @ dO_batch，累加到 tdKV_nope_batch
                     Tensor sdO_batch = make_tensor(
-                        make_smem_ptr(plan.dKV_cfg.do_buf.data() + col_offset * B_H),
+                        make_smem_ptr(plan.u.dKV_cfg.do_buf.data() + col_offset * B_H),
                         SmemLayoutdO_Batch{}
                     );
                     ku::utcmma_ts(tiled_mma_dV, sS, sdO_batch, tdKV_nope_batch, false);
@@ -622,7 +622,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
                 // Step 4c: dK_rope = dS^T @ Q_rope（单独存储，不分批）
                 if constexpr (HAVE_ROPE) {
-                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
+                    Tensor sQ_rope = make_tensor(make_smem_ptr(plan.u.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
                     ku::utcmma_ts(tiled_mma_dK, sdS, sQ_rope, tdK_rope, true);
                 }
 
