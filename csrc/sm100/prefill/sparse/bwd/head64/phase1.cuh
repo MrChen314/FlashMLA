@@ -90,8 +90,8 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     TiledMMA tiled_mma_P = TiledMMA_P{};
     TiledMMA tiled_mma_dPmid = TiledMMA_dPmid{};  // 用于 dP_mid = dO @ V^T
     TiledMMA tiled_mma_dQ = TiledMMA_dQ{};
-    TiledMMA tiled_mma_dKT = TiledMMA_dKT{};  // 用于 dK^T = Q^T @ dS
-    TiledMMA tiled_mma_dVT = TiledMMA_dVT{};  // 用于 dV^T = dO^T @ S
+    TiledMMA tiled_mma_dK = TiledMMA_dK{};    // 用于 dK = dS^T @ Q
+    TiledMMA tiled_mma_dV = TiledMMA_dV{};    // 用于 dV = S^T @ dO
 
     // TMEM tensor handles
     // 优化：使用分批处理策略以适应 512 列 TMEM 限制
@@ -111,12 +111,12 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     // dQ_rope 单独处理 (D_ROPE=64 < MMA_N_DIM，无需分批)
     Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_ROPE>>{});
     
-    // dKV 使用转置乘法策略：计算 dK^T 和 dV^T，然后转置存储
-    // dK^T/dV^T 的形状是 MMA_N_DIM x B_TOPK（每批），存储时转置为 B_TOPK x MMA_N_DIM
-    Tensor tdKVT_batch = partition_fragment_C(tiled_mma_dKT, Shape<Int<MMA_N_DIM>, Int<B_TOPK>>{});
+    // dKV 使用交换 AB 策略：dK = dS^T @ Q, dV = S^T @ dO
+    // 输出形状是 B_TOPK x MMA_N_DIM（每批）
+    Tensor tdKV_batch = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<MMA_N_DIM>>{});
     
     // dK_rope 使用相同策略
-    Tensor tdK_ropeT = partition_fragment_C(tiled_mma_dKT, Shape<Int<D_ROPE>, Int<B_TOPK>>{});
+    Tensor tdK_rope = partition_fragment_C(tiled_mma_dK, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
 
     tP.data().get() = tmem_cols::P;
     tDPmid.data().get() = tmem_cols::P;  // 复用 P 的 TMEM 空间
@@ -125,10 +125,10 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     // 第二批 (cols 256-511) 复用同一区域
     tdQ_batch.data().get() = tmem_cols::dQ;
     tdQ_rope.data().get() = tmem_cols::dQ + MMA_N_DIM/2;  // After NoPE batch part (128 TMEM cols)
-    // dKV^T 分批使用同一 TMEM 区域
-    // 注意：dK^T/dV^T 形状是 MMA_N_DIM x B_TOPK = 256 x 64，存储时转置
-    tdKVT_batch.data().get() = tmem_cols::dKV_nope;
-    tdK_ropeT.data().get() = tmem_cols::dK_rope;
+    // dKV 分批使用同一 TMEM 区域
+    // 形状是 B_TOPK x MMA_N_DIM = 64 x 256
+    tdKV_batch.data().get() = tmem_cols::dKV_nope;
+    tdK_rope.data().get() = tmem_cols::dK_rope;
 
     // Initialize barriers and TMEM allocation
     if (warp_idx == 0) {
@@ -627,42 +627,42 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
                 // ===== Step 4: 使用转置乘法计算 dKV =====
                 // 原算法：dK = dS^T @ Q, dV = S^T @ dO
-                // 新算法：dK^T = Q^T @ dS, dV^T = dO^T @ S
-                // 计算结果是 dK^T 和 dV^T，在存储时转置到全局内存的正确位置
+                // 新算法：dK = dS^T @ Q, dV = S^T @ dO
+                // 交换 AB 使得 M=B_TOPK=64（符合 MMA M轴限制），N=MMA_N_DIM=256
+                // 输出形状为 B_TOPK x MMA_N_DIM
                 
                 // 等待 S 就绪
                 plan.bar_s_ready.wait((k/NUM_BUFS) & 1);
                 
-                // S 和 dS 作为 B 矩阵（K-major）
-                Tensor sS = make_tensor(make_smem_ptr(plan.s_buf), SmemLayoutP{});
-                Tensor sdS_B = make_tensor(make_smem_ptr(plan.ds_buf), SmemLayoutP{});
+                // S^T 和 dS^T 作为 A 矩阵（MN-major，通过 composition 从 K-major 转置）
+                Tensor sST = make_tensor(make_smem_ptr(plan.s_buf), SmemLayoutST{});
+                Tensor sdST = make_tensor(make_smem_ptr(plan.ds_buf), SmemLayoutdST{});
                 
                 // 分批处理 dKV_nope（按 D_V=512 的列维度分批）
                 for (int batch = 0; batch < DV_NUM_BATCHES; ++batch) {
                     const int col_offset = batch * MMA_N_DIM;  // 0 或 256
                     
-                    // Step 4a: dK^T_batch = Q_batch^T @ dS
-                    // A (Q^T): MMA_N_DIM x B_H (通过 composition 得到 MN-major)
-                    // B (dS): B_H x B_TOPK (K-major)
-                    // C (dK^T): MMA_N_DIM x B_TOPK
-                    Tensor sQT_batch = make_tensor(
+                    // Step 4a: dK_batch = dS^T @ Q_batch
+                    // A (dS^T): B_TOPK x B_H (MN-major)
+                    // B (Q): B_H x MMA_N_DIM (K-major)
+                    // C (dK): B_TOPK x MMA_N_DIM
+                    Tensor sQ_batch = make_tensor(
                         make_smem_ptr(plan.u.dKV_cfg.q_buf.data() + col_offset * B_H),
-                        SmemLayoutQT_Batch<MMA_N_DIM>{}
+                        SmemLayoutQ_Batch<MMA_N_DIM>{}
                     );
-                    ku::utcmma_ss(tiled_mma_dKT, sQT_batch, sdS_B, tdKVT_batch, true);
+                    ku::utcmma_ss(tiled_mma_dK, sdST, sQ_batch, tdKV_batch, true);
                     
-                    // Step 4b: dV^T_batch = dO_batch^T @ S，累加到 tdKVT_batch
-                    // A (dO^T): MMA_N_DIM x B_H (通过 composition 得到 MN-major)
-                    // B (S): B_H x B_TOPK (K-major)
-                    // C (dV^T): MMA_N_DIM x B_TOPK
-                    Tensor sdOT_batch = make_tensor(
+                    // Step 4b: dV_batch = S^T @ dO_batch，累加到 tdKV_batch
+                    // A (S^T): B_TOPK x B_H (MN-major)
+                    // B (dO): B_H x MMA_N_DIM (K-major)
+                    // C (dV): B_TOPK x MMA_N_DIM
+                    Tensor sdO_batch = make_tensor(
                         make_smem_ptr(plan.u.dKV_cfg.do_buf.data() + col_offset * B_H),
-                        SmemLayoutdOT_Batch<MMA_N_DIM>{}
+                        SmemLayoutdO_Batch<MMA_N_DIM>{}
                     );
-                    ku::utcmma_ss(tiled_mma_dVT, sdOT_batch, sS, tdKVT_batch, false);
+                    ku::utcmma_ss(tiled_mma_dV, sST, sdO_batch, tdKV_batch, false);
                     
-                    // 通知该批次 dKV^T 就绪
-                    // 注意：消费者需要读取 dKV^T 并转置存储到全局内存
+                    // 通知该批次 dKV 就绪
                     plan.bar_dkv_ready[cur_buf].arrive();
                     
                     // 等待消费者完成消费
@@ -670,14 +670,14 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     ku::tcgen05_after_thread_sync();
                 }
 
-                // Step 4c: dK_rope^T = Q_rope^T @ dS（单独计算）
-                // 注意：结果是 D_ROPE x B_TOPK，存储时转置为 B_TOPK x D_ROPE
+                // Step 4c: dK_rope = dS^T @ Q_rope（单独计算）
+                // 输出形状：B_TOPK x D_ROPE
                 if constexpr (HAVE_ROPE) {
-                    Tensor sQT_rope = make_tensor(
+                    Tensor sQ_rope = make_tensor(
                         make_smem_ptr(plan.u.dKV_cfg.q_rope_buf.data()),
-                        SmemLayoutQT_Batch<D_ROPE>{}
+                        SmemLayoutQ_Batch<D_ROPE>{}
                     );
-                    ku::utcmma_ss(tiled_mma_dKT, sQT_rope, sdS_B, tdK_ropeT, true);
+                    ku::utcmma_ss(tiled_mma_dK, sdST, sQ_rope, tdK_rope, true);
                 }
 
                 // plan.bar_dkv_ready[cur_buf].arrive(); // Handled inside loop
