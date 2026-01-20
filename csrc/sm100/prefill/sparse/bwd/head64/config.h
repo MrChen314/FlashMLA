@@ -121,6 +121,8 @@ using SmemLayoutKRoPE = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
+// P/S/dS 的 K-major 布局 (B_H x B_TOPK)
+// 用于 A 矩阵时 (如 dQ = dS @ K)
 using SmemLayoutP = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_INTER_Atom<bf16>{},
     Shape<Int<B_H>, Int<B_TOPK>>{},
@@ -128,6 +130,50 @@ using SmemLayoutP = decltype(coalesce(tile_to_shape(
 ), Shape<_1, _1>{}));
 
 using SmemLayoutdP = SmemLayoutP;
+
+// Q^T 的 MN-major 布局，用于 dK^T = Q^T @ dS
+// Q 存储为 B_H x D_V (K-major, SmemLayoutQ，使用 SW128_Atom)
+// 通过 composition 创建 D_V x B_H 的转置视图
+// 这样可以计算 dK^T = Q^T @ dS，然后转置存储得到 dK
+template<int NUM_COLS>
+using SmemLayoutQT_Batch = decltype(coalesce(
+    composition(
+        decltype(coalesce(tile_to_shape(
+            UMMA::Layout_K_SW128_Atom<bf16>{},
+            Shape<Int<B_H>, Int<NUM_COLS>>{},
+            Step<_1, _2>{}
+        ), Shape<_1, _1>{})){},  // B_H x NUM_COLS, K-major
+        Layout<Shape<Int<NUM_COLS>, Int<B_H>>, Stride<Int<B_H>, _1>>{}  // 转置为 NUM_COLS x B_H
+    )
+, Shape<_1, _1>{}));
+
+// dO^T 的 MN-major 布局，用于 dV^T = dO^T @ S
+// dO 存储为 B_H x D_V (K-major, SmemLayoutdO，使用 SW128_Atom)
+template<int NUM_COLS>
+using SmemLayoutdOT_Batch = decltype(coalesce(
+    composition(
+        decltype(coalesce(tile_to_shape(
+            UMMA::Layout_K_SW128_Atom<bf16>{},
+            Shape<Int<B_H>, Int<NUM_COLS>>{},
+            Step<_1, _2>{}
+        ), Shape<_1, _1>{})){},  // B_H x NUM_COLS, K-major
+        Layout<Shape<Int<NUM_COLS>, Int<B_H>>, Stride<Int<B_H>, _1>>{}  // 转置为 NUM_COLS x B_H
+    )
+, Shape<_1, _1>{}));
+
+// V^T 的布局，用于 dP_mid = dO @ V^T
+// KV buffer 存储为 B_TOPK x D_K (K-major)，取 V 部分 (前 D_V 列)
+// 对于 dP_mid = dO @ V^T:
+//   dO: B_H x D_V (M x K)
+//   V^T: D_V x B_TOPK (K x N)
+//   结果: B_H x B_TOPK (M x N)
+// V^T 通过 composition 将 K buffer 解释为 MN-major
+using SmemLayoutVT = decltype(coalesce(
+    composition(
+        SmemLayoutKTiles<D_V/64>{},  // B_TOPK x D_V, K-major
+        Layout<Shape<Int<D_V>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}  // 转置为 D_V x B_TOPK
+    )
+, Shape<_1, _1>{}));
 
 template<int NUM_TILES>
 using SmemLayoutdQTiles = decltype(coalesce(tile_to_shape(
@@ -203,28 +249,45 @@ using TiledMMA_P = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_H, 128, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
-// dP_mid = dO @ V^T
-using TiledMMA_dP = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
-));
-
 // SM100 MMA N维度只支持 64/128/256，D_V=512 需要分批处理
 constexpr int MMA_N_DIM = 256;  // 使用支持的最大N维度
 constexpr int DV_NUM_BATCHES = D_V / MMA_N_DIM;  // 512/256 = 2批
 
+// dP_mid = dO @ V^T
+// A (dO): B_H x D_V (M x K), K-major
+// B (V^T): D_V x B_TOPK (K x N)，MN-major 布局（通过 composition 从 K buffer 转置）
+// 输出: B_H x B_TOPK (M x N)
+using TiledMMA_dPmid = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
 // dQ += dS @ K (分批处理: K 的 D_V 维度拆分为 2 x 256)
+// A (dS): B_H x B_TOPK, K-major
+// B (K): B_TOPK x MMA_N_DIM, K-major
 using TiledMMA_dQ = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, MMA_N_DIM, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
-// dK = dS^T @ Q (分批处理: Q 的 D_V 维度拆分为 2 x 256)
-using TiledMMA_dK = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, MMA_N_DIM, UMMA::Major::MN, UMMA::Major::K>{}
+// 采用转置乘法策略避免 S/dS 的 MN-major 布局问题：
+// 原: dK = dS^T @ Q  =>  新: dK^T = Q^T @ dS
+// 原: dV = S^T @ dO  =>  新: dV^T = dO^T @ S
+// 计算结果是 dK^T 和 dV^T，在存储时转置到正确位置
+
+// dK^T = Q^T @ dS (分批处理)
+// A (Q^T): MMA_N_DIM x B_H (通过 SmemLayoutQT_Batch composition，MN-major)
+// B (dS): B_H x B_TOPK, K-major (SmemLayoutP)
+// C (dK^T): MMA_N_DIM x B_TOPK
+// 注意：Q^T 通过 composition 得到 MN-major，使用 Major::MN
+using TiledMMA_dKT = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, MMA_N_DIM, B_TOPK, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
-// dV = P^T @ dO (分批处理: dO 的 D_V 维度拆分为 2 x 256)
-using TiledMMA_dV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, MMA_N_DIM, UMMA::Major::MN, UMMA::Major::K>{}
+// dV^T = dO^T @ S (分批处理)
+// A (dO^T): MMA_N_DIM x B_H (通过 SmemLayoutdOT_Batch composition，MN-major)
+// B (S): B_H x B_TOPK, K-major (SmemLayoutP)
+// C (dV^T): MMA_N_DIM x B_TOPK
+using TiledMMA_dVT = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, MMA_N_DIM, B_TOPK, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 // Named barriers for synchronization
