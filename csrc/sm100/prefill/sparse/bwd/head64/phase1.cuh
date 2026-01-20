@@ -599,18 +599,20 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     
                     // Step 4a: dK_nope_batch = dS^T @ Q_nope_batch
                     // 注意：需要使用 Q 的对应列切片
+                    // 使用 utcmma_ss 因为 dS 和 Q 都来自 SMEM
                     Tensor sQ_batch = make_tensor(
                         make_smem_ptr(plan.u.dKV_cfg.q_buf.data() + col_offset * B_H),
                         SmemLayoutQ_Batch{}
                     );
-                    ku::utcmma_ts(tiled_mma_dK, sdS, sQ_batch, tdKV_nope_batch, true);
+                    ku::utcmma_ss(tiled_mma_dK, sdS, sQ_batch, tdKV_nope_batch, true);
                     
                     // Step 4b: dV_batch = S^T @ dO_batch，累加到 tdKV_nope_batch
+                    // 使用 utcmma_ss 因为 S 和 dO 都来自 SMEM
                     Tensor sdO_batch = make_tensor(
                         make_smem_ptr(plan.u.dKV_cfg.do_buf.data() + col_offset * B_H),
                         SmemLayoutdO_Batch{}
                     );
-                    ku::utcmma_ts(tiled_mma_dV, sS, sdO_batch, tdKV_nope_batch, false);
+                    ku::utcmma_ss(tiled_mma_dV, sS, sdO_batch, tdKV_nope_batch, false);
                     
                     // 通知该批次 dKV 就绪
                     plan.bar_dkv_ready[cur_buf].arrive();
@@ -621,9 +623,10 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                 }
 
                 // Step 4c: dK_rope = dS^T @ Q_rope（单独存储，不分批）
+                // 使用 utcmma_ss 因为 dS 和 Q_rope 都来自 SMEM
                 if constexpr (HAVE_ROPE) {
                     Tensor sQ_rope = make_tensor(make_smem_ptr(plan.u.dKV_cfg.q_rope_buf.data()), SmemLayoutQRoPE{});
-                    ku::utcmma_ts(tiled_mma_dK, sdS, sQ_rope, tdK_rope, true);
+                    ku::utcmma_ss(tiled_mma_dK, sdS, sQ_rope, tdK_rope, true);
                 }
 
                 // plan.bar_dkv_ready[cur_buf].arrive(); // Handled inside loop
