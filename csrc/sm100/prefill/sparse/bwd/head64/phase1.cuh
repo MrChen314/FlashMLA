@@ -373,10 +373,14 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             fence_view_async_shared();
             
             // TMA store dQ to global memory
-            cute::copy(tma_params.tma_dQ, sdQ, 
-                make_tensor(make_gmem_ptr((bf16*)params.d_q + s_q_idx * params.stride_dq_s_q), 
-                    make_layout(make_shape(Int<B_H>{}, Int<D_Q>{}), 
-                        make_stride(params.stride_dq_h_q, _1{}))));
+            // 使用 TMA descriptor 的正确方式：通过 get_tma_tensor 获取 global tensor
+            auto thr_tma = tma_params.tma_dQ.get_slice(_0{});
+            Tensor tma_gdQ = tma_params.tma_dQ.get_tma_tensor(tma_params.shape_dQ)(_, _, s_q_idx);
+            cute::copy(
+                tma_params.tma_dQ,
+                thr_tma.partition_S(sdQ),
+                thr_tma.partition_D(tma_gdQ)
+            );
         }
 
         if (warp_idx == 0) {
@@ -554,9 +558,11 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                         Step<_1, _2>{}
                     ), Shape<_1, _1>{}));
                     
-                    const int k_col_offset = dq_batch * MMA_N_DIM * B_TOPK;  // 偏移到对应的列块
+                    // K buffer 布局是 [B_TOPK, D_K]，要访问第 batch 个列块，需要跳过 batch*MMA_N_DIM*B_TOPK 个元素
+                    // 但由于 swizzled layout 的 tile 组织，实际偏移是 B_TOPK * 列偏移
+                    const int k_col_offset = dq_batch * MMA_N_DIM;  // 列偏移
                     Tensor sK_batch = make_tensor(
-                        make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data() + k_col_offset),
+                        make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data() + B_TOPK * k_col_offset),
                         SmemLayoutK_Batch{}
                     );
                     
