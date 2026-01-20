@@ -141,7 +141,7 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
 
         // Initialize TMEM
         cute::TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator2Sm().release_allocation_lock();
     }
 

@@ -162,7 +162,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
         // 优化：TMEM 布局压缩到 512 列限制内
         // dQ: 288 cols + dKV_batch: 128 cols + dK_rope: 32 cols + Q_part: 64 cols = 512 cols
         cute::TMEM::Allocator1Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
 
@@ -351,8 +351,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             
             // Load dQ from TMEM (每个线程加载自己负责的行)
             float2 dq_vals[D_Q / 32]; // 每个线程持有 D_Q/32 个 float2 (对应 D_Q 维)
-            // 修复：tmem_ld_32dp32bNx 加载 32 行，每列 128 字节
-            ku::tmem_ld_32dp32bNx<D_Q/32>(tmem_cols::dQ + my_row_offset * (128 / 4), dq_vals);
+            // 修复：tmem_ld_32dp32bNx 只支持 1,2,4,8,16,32,64,128，所以拆分 18 = 16 + 2
+            ku::tmem_ld_32dp32bNx<16>(tmem_cols::dQ + my_row_offset * (128 / 4), dq_vals);
+            ku::tmem_ld_32dp32bNx<2>(tmem_cols::dQ + my_row_offset * (128 / 4) + 16, dq_vals + 16);
             cutlass::arch::fence_view_async_tmem_load();
             
             // Convert to bf16 and store to shared memory
@@ -495,15 +496,20 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
 
                 // ===== Step 1: Recompute P = Q @ K^T =====
                 Tensor sQ = make_tensor(make_smem_ptr(plan.u.dKV_cfg.q_buf.data()), SmemLayoutQ{});
-                Tensor sK = make_tensor(make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutK{});
-
+                
                 // Wait for K to be ready
                 plan.bar_k_ready[cur_buf][0].arrive_and_expect_tx(B_TOPK * D_V/2 * sizeof(bf16));
                 plan.bar_k_ready[cur_buf][0].wait((k/NUM_BUFS) & 1);
                 ku::tcgen05_after_thread_sync();
 
-                // P = Q @ K^T (NoPE part)
-                ku::utcmma_ss(tiled_mma_P, sQ, sK, tP, true);
+                // P = Q @ K^T (NoPE part) - 只使用 K 的前 D_V 列
+                using SmemLayoutK_NoPE = decltype(coalesce(tile_to_shape(
+                    UMMA::Layout_K_SW128_Atom<bf16>{},
+                    Shape<Int<B_TOPK>, Int<D_V>>{},
+                    Step<_1, _2>{}
+                ), Shape<_1, _1>{}));
+                Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.dQ_cfg.k_buf[cur_buf].data()), SmemLayoutK_NoPE{});
+                ku::utcmma_ss(tiled_mma_P, sQ, sK_nope, tP, true);
                 
                 // Wait for K RoPE part
                 plan.bar_k_ready[cur_buf][1].arrive_and_expect_tx(B_TOPK * (D_K-D_V)/2 * sizeof(bf16));
@@ -618,7 +624,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     plan.bar_dkv_ready[cur_buf].arrive();
                     
                     // 等待消费者完成消费
-                    plan.bar_dkv_accum_done[cur_buf].wait();
+                    plan.bar_dkv_accum_done[cur_buf].wait((k/NUM_BUFS) & 1);
                     ku::tcgen05_after_thread_sync();
                 }
 

@@ -143,7 +143,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
         // Initialize TMEM
         cute::TMEM::Allocator1Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
 
