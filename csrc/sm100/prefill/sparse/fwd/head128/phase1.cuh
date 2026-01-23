@@ -81,6 +81,10 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
         cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
         cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
+        // 预取P矩阵的TMA descriptor（如果需要输出P）
+        if (params.p_out != nullptr) {
+            cute::prefetch_tma_descriptor(tma_params.tma_P.get_tma_descriptor());
+        }
     }
 
     // Define shared tensors
@@ -141,7 +145,7 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
 
         // Initialize TMEM
         cute::TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator2Sm().release_allocation_lock();
     }
 
@@ -197,6 +201,61 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
             for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
                 if (!(is_k_valid_hi >> i & 1))
                     p_float[i+(B_TOPK/2)/2] = -CUDART_INF_F;
+            }
+
+            // Output P matrix (after mask) via shared memory + TMA
+            if (params.p_out != nullptr) {
+                // 如果不是第一次迭代，我们需要等待上一次迭代的 TMA 完成，才能安全地复用 plan.p
+                if (k > 0) {
+                    if (warp_idx == 0 && elect_one_sync()) {
+                        cute::tma_store_wait<0>();
+                    }
+                    NamedBarrier::arrive_and_wait(128, 1);
+                }
+
+                // 将P数据写入shared memory
+                // shared memory布局: row-major [B_H/2][B_TOPK]
+                // 线程0-63写入topk位置0-63，线程64-127写入topk位置64-127
+                int smem_h = idx_in_warpgroup % 64;  // head index in shared memory
+                int smem_t_base = (idx_in_warpgroup < 64) ? 0 : 64;  // topk offset
+                float* sP_row = plan.p + smem_h * B_TOPK + smem_t_base;
+                
+                CUTE_UNROLL
+                for (int i = 0; i < (B_TOPK/2); i += 4) {
+                    cutlass::Array<float, 4> p_vec;
+                    CUTE_UNROLL
+                    for (int j = 0; j < 4; ++j) {
+                        p_vec[j] = p_float[i + j];
+                    }
+                    // 128-bit store to shared memory
+                    *reinterpret_cast<cutlass::Array<float, 4>*>(sP_row + i) = p_vec;
+                }
+                
+                // 同步确保所有线程都写完shared memory
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, 1);
+                
+                // 使用TMA将P从shared memory异步传输到全局内存
+                if (warp_idx == 0 && elect_one_sync()) {
+                    Tensor sP = make_tensor(make_smem_ptr(plan.p), SmemLayoutP{});
+                    Tensor tma_gP = flat_divide(
+                        tma_params.tma_P.get_tma_tensor(tma_params.shape_P)(_, _, s_q_idx),
+                        Shape<Int<B_H/2>, Int<B_TOPK>>{}
+                    )(_, _, cta_idx, _);
+                    Tensor sP_divided = flat_divide(
+                        sP,
+                        Shape<Int<B_H/2>, Int<B_TOPK>>{}
+                    )(_, _, _0{}, _);
+                    auto thr_tma_P = tma_params.tma_P.get_slice(_0{});
+                    
+                    cute::copy(
+                        tma_params.tma_P,
+                        thr_tma_P.partition_S(sP_divided(_, _, k)),
+                        thr_tma_P.partition_D(tma_gP(_, _, k))
+                    );
+                    cute::tma_store_arrive(); // 必须调用 arrive 以推进 TMA store
+                }
+                // 这里不再立即等待完成，而是继续执行后续的 max/exp 计算，实现计算与 IO 重叠
             }
 
             // Get rowwise max of Pi
@@ -282,6 +341,14 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
             
             fence_view_async_shared();
             plan.bar_so_ready[k%NUM_BUFS].arrive(0u);
+        }
+
+        // 在循环结束后，等待最后一次 P 矩阵的 TMA 传输完成
+        if (params.p_out != nullptr) {
+            if (warp_idx == 0 && elect_one_sync()) {
+                cute::tma_store_wait<0>();
+            }
+            NamedBarrier::arrive_and_wait(128, 1);
         }
 
         // Epilogue
@@ -655,6 +722,23 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
         (typename Kernel::template SmemLayoutOTiles<1>){}
     );
 
+    // P矩阵的TMA配置：shape是[h_q, topk, s_q]，用于异步传输attention权重
+    // 全局内存布局：[s_q, h_q, topk]，stride是[h_q*topk, topk, 1]
+    // 每个CTA处理B_H/2个heads，每个k block处理B_TOPK个topk元素
+    auto shape_P = make_shape(params.h_q, params.topk, params.s_q);
+    auto tma_P = cute::make_tma_copy(
+        SM90_TMA_STORE{},
+        make_tensor(
+            make_gmem_ptr((float*)params.p_out),
+            make_layout(
+                shape_P,
+                make_stride(params.topk, _1{}, params.h_q*params.topk)
+            )
+        ),
+        // 每次传输一个tile: [B_H/2, B_TOPK] = [64, 128]
+        Layout<Shape<Int<Kernel::B_H/2>, Int<Kernel::B_TOPK>>, Stride<Int<Kernel::B_TOPK>, _1>>{}
+    );
+
     CUtensorMap tensor_map_kv;
     {
         uint64_t size[2] = {D_QK, (unsigned long)params.s_kv};
@@ -680,10 +764,12 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
 
     TmaParams<
         decltype(shape_Q), decltype(tma_Q),
-        decltype(shape_O), decltype(tma_O)
+        decltype(shape_O), decltype(tma_O),
+        decltype(shape_P), decltype(tma_P)
     > tma_params = {
         shape_Q, tma_Q,
         shape_O, tma_O,
+        shape_P, tma_P,
         tensor_map_kv
     };
     auto kernel = &sparse_attn_fwd_kernel<Kernel, decltype(tma_params)>;

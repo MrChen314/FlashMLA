@@ -13,11 +13,13 @@ using namespace cute;
 
 template<
     typename Shape_Q, typename TMA_Q,
-    typename Shape_O, typename TMA_O
+    typename Shape_O, typename TMA_O,
+    typename Shape_P = void*, typename TMA_P = void*
 >
 struct TmaParams {
     Shape_Q shape_Q; TMA_Q tma_Q;
     Shape_O shape_O; TMA_O tma_O;
+    Shape_P shape_P; TMA_P tma_P;  // P矩阵的TMA参数，用于异步输出attention权重
     CUtensorMap tensor_map_kv;
 };
 
@@ -89,6 +91,14 @@ using SmemLayoutSTiles = decltype(coalesce(tile_to_shape(
 	Shape<Int<B_H/2>, Int<64*NUM_TILES>>{},
 	Step<_1, _2>{}
 ), Shape<_1, _1>{}));
+
+// P矩阵的SmemLayout，用于TMA传输
+// P的shape是[B_H/2, B_TOPK] = [64, 128]，数据类型是float
+// 使用row-major布局，每行B_TOPK个float
+using SmemLayoutP = Layout<Shape<Int<B_H/2>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>;
+
+// P矩阵TMA传输的分块大小
+static constexpr int B_P_EPI = B_TOPK;  // 每次传输一整行的topk维度
 
 struct SharedMemoryPlan {
     union {
