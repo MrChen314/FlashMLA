@@ -52,12 +52,13 @@ constexpr int SPLIT_STORE = 2;          // dKV 分批写入因子
 
 // ============================================================================
 // TMEM 列映射
-// 基于 SM100反向资源占用分析.md:
+// 基于 SM100反向资源占用分析.md (已更新为分块计算):
 //   P: [64, 32] float32, columns 0~16
 //   dP: [64, 32] float32, columns 16~32
-//   dKV_NoPE: [32, 512] float32, columns 32~160
+//   dKV_NoPE: [32, 512] float32, columns 32~160 (分两部分: part0 32~96, part1 96~160)
 //   dKV_RoPE: [32, 64] float32, columns 160~176
-//   dQ: [64, 576] float32, columns 176~464
+//   dQ_NoPE: [64, 512] float32, columns 176~432 (分两部分: part0 176~304, part1 304~432)
+//   dQ_RoPE: [64, 64] float32, columns 432~464
 // 总占用: 464 列 (90.6% 利用率)
 // ============================================================================
 namespace tmem_cols {
@@ -70,17 +71,24 @@ namespace tmem_cols {
     constexpr int dP = 16;
     
     // dKV NoPE 累加器: dKey/dValue 梯度累加 (NoPE 部分)
-    // Shape: [B_TOPK, D_V] = [32, 512], 需要 512*32/128 = 128 列
-    constexpr int dKV = 32;
+    // 由于 MMA N=256 限制，分成两部分存储
+    // Shape: [B_TOPK, 256] × 2 = [32, 512], 每部分需要 256*32/128 = 64 列
+    constexpr int dKV = 32;           // dKV_part0: 32~96
+    constexpr int dKV_part1 = 96;     // dKV_part1: 96~160
     
     // dKV RoPE 累加器: dKey/dValue 梯度累加 (RoPE 部分)
     // Shape: [B_TOPK, D_ROPE] = [32, 64], 需要 64*32/128 = 16 列
     constexpr int dKV_RoPE = 160;
     
-    // dQ 累加器: dQuery 梯度累加
-    // Shape: [B_H, D_Q] = [64, 576], 需要 576*64/128 = 288 列
-    constexpr int dQ = 176;
-    constexpr int dQ_RoPE = 176 + 256;  // dQ 的 RoPE 部分起始列
+    // dQ NoPE 累加器: dQuery 梯度累加 (NoPE 部分)
+    // 由于 MMA N=256 限制，分成两部分存储
+    // Shape: [B_H, 256] × 2 = [64, 512], 每部分需要 256*64/128 = 128 列
+    constexpr int dQ = 176;           // dQ_part0: 176~304
+    constexpr int dQ_part1 = 304;     // dQ_part1: 304~432
+    
+    // dQ RoPE 累加器: dQuery 梯度累加 (RoPE 部分)
+    // Shape: [B_H, D_ROPE] = [64, 64], 需要 64*64/128 = 32 列
+    constexpr int dQ_RoPE = 432;      // dQ_RoPE: 432~464
 }
 
 // ============================================================================
@@ -131,6 +139,27 @@ using SmemLayoutV = decltype(coalesce(
 using SmemLayoutKVRoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW64_Atom<bf16>{},
     Shape<Int<B_TOPK>, Int<D_ROPE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// ============================================================================
+// 分块计算布局 (用于支持 N=256 的 MMA 分次累加)
+// 参考前向 config.h 的 SmemLayoutKNoPE_TiledMMA
+// ============================================================================
+
+// KV NoPE 分块布局 (用于 dQ 计算): [B_TOPK, D_V/2] = [32, 256]
+// 将 [32, 512] 的 KV_nope 分成两个 [32, 256] 的块进行计算
+using SmemLayoutKVNoPE_TiledMMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_TOPK>, Int<D_V/2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// Q/dO NoPE 分块布局 (用于 dKV 计算): [B_H, D_V/2] = [64, 256]
+// 将 [64, 512] 的 Q_nope/dO 分成两个 [64, 256] 的块进行计算
+using SmemLayoutQNoPE_TiledMMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_V/2>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
@@ -252,17 +281,19 @@ struct SharedMemoryPlan {
 // 输入: A (Q/dO) 在 SMEM [64, 512], Major::K
 //       B (K^T) 在 SMEM [32, 512]^T, Major::MN (转置后 K 沿 M 维度连续)
 // 输出: TMEM P/dP [64, 32]
+// 注意: 使用 SS_NOELECT (非 WS 版本) 以支持 N=32 (WS_SS_NOELECT 只支持 N>=64)
 using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 // dKV 计算 MMA: S^T×dO → dKV, ds^T×Q → dKV
-// Shape: [B_TOPK, D_V] = [32, 512]
+// Shape: [B_TOPK, 256] (原 [32, 512]，分两次累加)
 // 输入: A (S^T/ds^T) 在 SMEM [64, 32]^T, Major::MN (转置后 S 沿 M 维度连续)
-//       B (dO/Q) 在 SMEM [64, 512], Major::K
-// 输出: TMEM dKV [32, 512]
+//       B (dO/Q) 在 SMEM [64, 256] (分块), Major::K
+// 输出: TMEM dKV [32, 256] (分两部分存储)
+// 注意: N=512 超出 WS_SS_NOELECT 支持范围 (最大 256)，需要分两次累加
 using TiledMMA_dKV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_V, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 // dKV_RoPE 计算 MMA: ds^T×Q_rope → dKV_RoPE
@@ -275,12 +306,13 @@ using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
 ));
 
 // dQ 计算 MMA: ds×K → dQ
-// Shape: [B_H, D_V] = [64, 512]
+// Shape: [B_H, 256] (原 [64, 512]，分两次累加)
 // 输入: A (ds) 在 SMEM [64, 32], Major::K
-//       B (K) 在 SMEM [32, 512], Major::K
-// 输出: TMEM dQ [64, 512]
+//       B (K) 在 SMEM [32, 256] (分块), Major::K
+// 输出: TMEM dQ [64, 256] (分两部分存储)
+// 注意: N=512 超出 WS_SS_NOELECT 支持范围 (最大 256)，需要分两次累加
 using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, D_V, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
 // dQ_RoPE 计算 MMA: ds×K_rope → dQ_RoPE

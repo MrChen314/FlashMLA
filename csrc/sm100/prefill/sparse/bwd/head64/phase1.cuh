@@ -108,22 +108,30 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
     // dP 矩阵片段: [B_H, B_TOPK] = [64, 32]
     Tensor tdP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, Int<B_TOPK>>{});
     
-    // dQ 累加器片段: [B_H, D_V] = [64, 512]
-    Tensor tdQ = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_V>>{});
+    // dQ 累加器片段 (分两部分，因为 MMA N=256 限制)
+    // dQ_part0: [B_H, 256] = [64, 256]
+    // dQ_part1: [B_H, 256] = [64, 256]
+    Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_V/2>>{});
+    Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H>, Int<D_V/2>>{});
     // dQ_RoPE 累加器片段: [B_H, D_ROPE] = [64, 64]
     Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ_rope, Shape<Int<B_H>, Int<D_ROPE>>{});
     
-    // dKV 累加器片段: [B_TOPK, D_V] = [32, 512]
-    Tensor tdKV = partition_fragment_C(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<D_V>>{});
+    // dKV 累加器片段 (分两部分，因为 MMA N=256 限制)
+    // dKV_part0: [B_TOPK, 256] = [32, 256]
+    // dKV_part1: [B_TOPK, 256] = [32, 256]
+    Tensor tdKV_part0 = partition_fragment_C(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<D_V/2>>{});
+    Tensor tdKV_part1 = partition_fragment_C(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<D_V/2>>{});
     // dKV_RoPE 累加器片段: [B_TOPK, D_ROPE] = [32, 64]
     Tensor tdKV_rope = partition_fragment_C(tiled_mma_dKV_rope, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
 
     // 设置 TMEM 基地址
     tP.data().get() = tmem_cols::P;
     tdP.data().get() = tmem_cols::dP;
-    tdQ.data().get() = tmem_cols::dQ;
+    tdQ_part0.data().get() = tmem_cols::dQ;
+    tdQ_part1.data().get() = tmem_cols::dQ_part1;
     tdQ_rope.data().get() = tmem_cols::dQ_RoPE;
-    tdKV.data().get() = tmem_cols::dKV;
+    tdKV_part0.data().get() = tmem_cols::dKV;
+    tdKV_part1.data().get() = tmem_cols::dKV_part1;
     tdKV_rope.data().get() = tmem_cols::dKV_RoPE;
 
     // === Warp 0: 序言阶段 - 初始化barrier和加载Q/dO ===
@@ -328,6 +336,10 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
         Tensor sKV_rope = make_tensor(make_smem_ptr(plan.u.q_kv.kv_rope.data()), SmemLayoutKVRoPE{});
         Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
         Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
+        
+        // 将 dO 和 Q_nope 分成两部分用于 dKV 计算 (MMA N=256 限制)
+        Tensor sdO_divided = flat_divide(sdO, Tile<Int<B_H>, Int<D_V/2>>{})(_, _, _0{}, _);
+        Tensor sQ_nope_divided = flat_divide(sQ_nope, Tile<Int<B_H>, Int<D_V/2>>{})(_, _, _0{}, _);
 
         // 等待 Q 加载完成
         plan.bar_prologue_q_nope.arrive_and_expect_tx(B_H*D_V*sizeof(bf16));
@@ -410,21 +422,25 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             fence_view_async_shared();
             plan.bar_s_do_ready.arrive();  // 通知 WG2: S 已就绪
 
-            // --- 计算 dKV 第一部分: S^T × dO → dKV ---
+            // --- 计算 dKV: S^T × dO → dKV (分两部分，因为 MMA N=256 限制) ---
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
             ku::tcgen05_after_thread_sync();
 
-            // dKV = S^T × dO (clear_accum=true for first iteration)
-            ku::utcmma_ss(tiled_mma_dKV, sS, sdO, tdKV, k == 0);
+            // dKV_part0 = S^T × dO_part0 [32, 256]
+            ku::utcmma_ss(tiled_mma_dKV, sS, sdO_divided(_, _, 0), tdKV_part0, k == 0);
+            // dKV_part1 = S^T × dO_part1 [32, 256]
+            ku::utcmma_ss(tiled_mma_dKV, sS, sdO_divided(_, _, 1), tdKV_part1, k == 0);
 
-            // --- 等待 WG2 的 ds，计算 dKV 第二部分 ---
+            // --- 等待 WG2 的 ds，计算 dKV += ds^T × Q_nope ---
             plan.bar_dp_done.wait(k&1);
             ku::tcgen05_after_thread_sync();
 
             Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutS{});
 
-            // dKV += ds^T × Q_nope
-            ku::utcmma_ss(tiled_mma_dKV, sDS, sQ_nope, tdKV, false);
+            // dKV_part0 += ds^T × Q_nope_part0
+            ku::utcmma_ss(tiled_mma_dKV, sDS, sQ_nope_divided(_, _, 0), tdKV_part0, false);
+            // dKV_part1 += ds^T × Q_nope_part1
+            ku::utcmma_ss(tiled_mma_dKV, sDS, sQ_nope_divided(_, _, 1), tdKV_part1, false);
 
             // dKV_RoPE = ds^T × Q_rope (只在有 RoPE 时)
             if constexpr (HAVE_ROPE) {
@@ -438,9 +454,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             constexpr int HALF_ROWS = B_TOPK / SPLIT_STORE;
             float2 dkv_chunk[32];
             
-            // 写回 NoPE 部分前半
+            // 写回 NoPE 部分前半 (part0: 列 0~255)
             CUTE_UNROLL
-            for (int col_chunk = 0; col_chunk < D_V/64; ++col_chunk) {
+            for (int col_chunk = 0; col_chunk < (D_V/2)/64; ++col_chunk) {
                 ku::tmem_ld_32dp32bNx<64>(tmem_cols::dKV + col_chunk*64, dkv_chunk);
                 cutlass::arch::fence_view_async_tmem_load();
                 
@@ -450,6 +466,26 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     int kv_idx = gIndices[k*B_TOPK + row];
                     if (kv_idx >= 0 && kv_idx < params.s_kv) {
                         float* dKV_ptr = params.dKV + kv_idx * params.stride_dKV_s_kv + col_chunk*64;
+                        CUTE_UNROLL
+                        for (int j = 0; j < 64/4; ++j) {
+                            atomicAdd((float4*)(dKV_ptr + j*4), *(float4*)(dkv_chunk + row*32 + j*2));
+                        }
+                    }
+                }
+            }
+            
+            // 写回 NoPE 部分前半 (part1: 列 256~511)
+            CUTE_UNROLL
+            for (int col_chunk = 0; col_chunk < (D_V/2)/64; ++col_chunk) {
+                ku::tmem_ld_32dp32bNx<64>(tmem_cols::dKV_part1 + col_chunk*64, dkv_chunk);
+                cutlass::arch::fence_view_async_tmem_load();
+                
+                // 原子累加到全局内存 (列偏移 D_V/2)
+                CUTE_UNROLL
+                for (int row = 0; row < HALF_ROWS; ++row) {
+                    int kv_idx = gIndices[k*B_TOPK + row];
+                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
+                        float* dKV_ptr = params.dKV + kv_idx * params.stride_dKV_s_kv + (D_V/2) + col_chunk*64;
                         CUTE_UNROLL
                         for (int j = 0; j < 64/4; ++j) {
                             atomicAdd((float4*)(dKV_ptr + j*4), *(float4*)(dkv_chunk + row*32 + j*2));
@@ -494,6 +530,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
         Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
         Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
         Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutS{});
+
+        // 将 KV_nope 分成两部分用于 dQ 计算 (MMA N=256 限制)
+        Tensor sKV_nope_divided = flat_divide(sKV_nope, Tile<Int<B_TOPK>, Int<D_V/2>>{})(_, _, _0{}, _);
 
         // === 计算 Delta = sum(O * dO) ===
         // 从全局内存加载 O，从 SMEM 读取 dO
@@ -594,8 +633,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
             ku::tcgen05_after_thread_sync();
 
-            // dQ += ds × K_nope
-            ku::utcmma_ss(tiled_mma_dQ, sDS, sKV_nope, tdQ, k == 0);
+            // dQ += ds × K_nope (分两部分计算)
+            ku::utcmma_ss(tiled_mma_dQ, sDS, sKV_nope_divided(_, _, 0), tdQ_part0, k == 0);
+            ku::utcmma_ss(tiled_mma_dQ, sDS, sKV_nope_divided(_, _, 1), tdQ_part1, k == 0);
 
             // dQ_RoPE += ds × K_rope
             if constexpr (HAVE_ROPE) {
@@ -606,9 +646,9 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
             constexpr int HALF_ROWS = B_TOPK / SPLIT_STORE;
             float2 dkv_chunk[32];
 
-            // 写回 NoPE 部分后半
+            // 写回 NoPE 部分后半 (part0: 列 0~255)
             CUTE_UNROLL
-            for (int col_chunk = 0; col_chunk < D_V/64; ++col_chunk) {
+            for (int col_chunk = 0; col_chunk < (D_V/2)/64; ++col_chunk) {
                 ku::tmem_ld_32dp32bNx<64>(tmem_cols::dKV + col_chunk*64, dkv_chunk);
                 cutlass::arch::fence_view_async_tmem_load();
                 
@@ -617,6 +657,26 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, __gri
                     int kv_idx = gIndices[k*B_TOPK + row];
                     if (kv_idx >= 0 && kv_idx < params.s_kv) {
                         float* dKV_ptr = params.dKV + kv_idx * params.stride_dKV_s_kv + col_chunk*64;
+                        CUTE_UNROLL
+                        for (int j = 0; j < 64/4; ++j) {
+                            atomicAdd((float4*)(dKV_ptr + j*4), *(float4*)(dkv_chunk + (row-HALF_ROWS)*32 + j*2));
+                        }
+                    }
+                }
+            }
+            
+            // 写回 NoPE 部分后半 (part1: 列 256~511)
+            CUTE_UNROLL
+            for (int col_chunk = 0; col_chunk < (D_V/2)/64; ++col_chunk) {
+                ku::tmem_ld_32dp32bNx<64>(tmem_cols::dKV_part1 + col_chunk*64, dkv_chunk);
+                cutlass::arch::fence_view_async_tmem_load();
+                
+                // 原子累加到全局内存 (列偏移 D_V/2)
+                CUTE_UNROLL
+                for (int row = HALF_ROWS; row < B_TOPK; ++row) {
+                    int kv_idx = gIndices[k*B_TOPK + row];
+                    if (kv_idx >= 0 && kv_idx < params.s_kv) {
+                        float* dKV_ptr = params.dKV + kv_idx * params.stride_dKV_s_kv + (D_V/2) + col_chunk*64;
                         CUTE_UNROLL
                         for (int j = 0; j < 64/4; ++j) {
                             atomicAdd((float4*)(dKV_ptr + j*4), *(float4*)(dkv_chunk + (row-HALF_ROWS)*32 + j*2));
