@@ -91,12 +91,16 @@ ext_modules.append(
             "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
             "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
 
-            # sm100 sparse prefill
+            # sm100 sparse prefill forward
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
             "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
             "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+
+            # sm100 sparse prefill backward
+            "csrc/sm100/prefill/sparse/bwd/head64/instantiations/phase1_k512.cu",
+            "csrc/sm100/prefill/sparse/bwd/head64/instantiations/phase1_k576.cu",
 
             # sm100 sparse decode
             "csrc/sm100/decode/head64/instantiations/v32.cu",

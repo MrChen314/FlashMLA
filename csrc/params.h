@@ -167,6 +167,37 @@ struct SparseAttnFwdParams {
     cudaStream_t stream;
 };
 
+// 稀疏注意力反向传播参数结构体
+struct SparseAttnBwdParams {
+    int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    float sm_scale, sm_scale_div_log2;
+
+    // 输入张量
+    cutlass::bfloat16_t* __restrict__ q;     // [s_q, h_q, d_qk] Query
+    cutlass::bfloat16_t* __restrict__ kv;    // [s_kv, h_kv, d_qk] Key/Value
+    cutlass::bfloat16_t* __restrict__ o;     // [s_q, h_q, d_v] 前向输出 (用于计算delta)
+    cutlass::bfloat16_t* __restrict__ dO;    // [s_q, h_q, d_v] 输出梯度
+    int* __restrict__ indices;               // [s_q, h_kv, topk] TopK索引
+    float* __restrict__ lse;                 // [s_q, h_q] Log-Sum-Exp (来自前向)
+    int* __restrict__ topk_length;           // [s_q], 可为nullptr
+
+    // Strides
+    int stride_q_s_q; int stride_q_h_q;
+    int stride_kv_s_kv; int stride_kv_h_kv;
+    int stride_o_s_q; int stride_o_h_q;
+    int stride_dO_s_q; int stride_dO_h_q;
+    int stride_indices_s_q; int stride_indices_h_kv;
+
+    // 输出张量
+    cutlass::bfloat16_t* __restrict__ dQ;    // [s_q, h_q, d_qk] Query梯度
+    float* __restrict__ dKV;                 // [s_kv, h_kv, d_qk] KV梯度 (float32累加)
+    int stride_dQ_s_q; int stride_dQ_h_q;
+    int stride_dKV_s_kv; int stride_dKV_h_kv;
+
+    int num_sm;
+    cudaStream_t stream;
+};
+
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
 enum class SparseAttnFwdMode {
     Prefill,            // Normal prefill mode
