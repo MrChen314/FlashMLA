@@ -109,6 +109,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     // P矩阵片段 (注意力分数)
     Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
     // Q矩阵NoPE部分的两个分片 (用于分块计算)
+    //     TMEM 的 K 维度存储单位:
+    // - 每个 "K unit" = 2 个 bf16 元素
+    // - 256 个元素 = 128 个 "K units"
+
+    // partition_shape_A 的 K 参数:
+    // - 指定 "K units" 的数量
+    // - 不是元素的数量
+
+    // 因此:
+    // - partition_shape_A: [64, 128]  ← 128 个 K units
+    // - 实际矩阵: [64, 256]          ← 256 个元素
     Tensor tQ_nope_part0 = tiled_mma_P.get_slice(_0{}).make_fragment_A(
         partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<(D_V/2)/2>>{})
     );

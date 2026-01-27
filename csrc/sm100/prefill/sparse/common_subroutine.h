@@ -98,12 +98,22 @@ void retrieve_mask_and_reduce_p(
 
     // Mask invalid tokens
     // We put masking before reduction, since (-inf) + anything (except nan and +inf) is (-inf), which guarantees correctness, and this can overlap with smem load
-    static_assert(NUM_ELEMS_PER_THREAD == 32);
-    uint32_t is_k_valid = *(uint32_t*)(k_validness_base + (local_warp_idx>=2?NUM_ELEMS_PER_THREAD/8:0));
-    CUTE_UNROLL
-    for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
-        if (!(is_k_valid >> i & 1))
-            p[i] = -CUDART_INF_F;
+    static_assert(NUM_ELEMS_PER_THREAD == 16 || NUM_ELEMS_PER_THREAD == 32);
+
+    if constexpr (NUM_ELEMS_PER_THREAD == 32) {
+        uint32_t is_k_valid = *(uint32_t*)(k_validness_base + (local_warp_idx>=2?4:0));
+        CUTE_UNROLL
+        for (int i = 0; i < 32; i += 1) {
+            if (!(is_k_valid >> i & 1))
+                p[i] = -CUDART_INF_F;
+        }
+    } else if constexpr (NUM_ELEMS_PER_THREAD == 16) {
+        uint16_t is_k_valid = *(uint16_t*)(k_validness_base + (local_warp_idx>=2?2:0));
+        CUTE_UNROLL
+        for (int i = 0; i < 16; i += 1) {
+            if (!(is_k_valid >> i & 1))
+                p[i] = -CUDART_INF_F;
+        }
     }
 
     // Reduce P within the cluster

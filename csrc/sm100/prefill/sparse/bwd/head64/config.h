@@ -10,45 +10,165 @@ namespace sm100::bwd::head64 {
 using namespace cute;
 
 // ============================================================================
-// TMA 参数结构体
+// 维度常量定义
+// ============================================================================
+constexpr int D_Q = 576;                    // Query 维度
+constexpr int D_K = 576;                    // Key 维度  
+constexpr int D_V = 512;                    // Value/NoPE 维度
+constexpr int D_ROPE = D_Q - D_V;           // RoPE 维度 = 64
+constexpr float MAX_INIT_VAL = -1e30f;      // 用于 max logits 初始化
+
+constexpr int B_H = 64;                     // Query head 块大小
+constexpr int B_TOPK = 32;                  // TopK 块大小 (反向中使用32)
+constexpr int NUM_THREADS = 128 + 128 + 128;  // 3个 WarpGroup，每个128线程
+
+// ============================================================================
+// TMA 参数模板
 // ============================================================================
 template<
     typename Shape_Q_NoPE, typename TMA_Q_NoPE,
     typename Shape_Q_RoPE, typename TMA_Q_RoPE,
     typename Shape_dO, typename TMA_dO,
-    typename Shape_dQ, typename TMA_dQ
+    typename Shape_O, typename TMA_O
 >
 struct TmaParams {
-    Shape_Q_NoPE shape_Q_nope; TMA_Q_NoPE tma_Q_nope;   // Q 的 NoPE 部分
-    Shape_Q_RoPE shape_Q_rope; TMA_Q_RoPE tma_Q_rope;   // Q 的 RoPE 部分
-    Shape_dO shape_dO; TMA_dO tma_dO;                   // dOutput
-    Shape_dQ shape_dQ; TMA_dQ tma_dQ;                   // dQuery 输出
-    CUtensorMap tensor_map_kv_nope;                     // KV NoPE 部分的 TMA 描述符
-    CUtensorMap tensor_map_kv_rope;                     // KV RoPE 部分的 TMA 描述符
-};
-
-struct float2x2 {
-    float2 lo, hi;
+    Shape_Q_NoPE shape_Q_nope; TMA_Q_NoPE tma_Q_nope;
+    Shape_Q_RoPE shape_Q_rope; TMA_Q_RoPE tma_Q_rope;
+    Shape_dO shape_dO; TMA_dO tma_dO;
+    Shape_O shape_O; TMA_O tma_O;
+    CUtensorMap tensor_map_kv_nope;
 };
 
 // ============================================================================
-// 核心维度常量
-// 基于 TileLang 反向实现: D=512, D_tail=64, block_H=64, BS=32, threads=384
+// SMEM Layout 定义
 // ============================================================================
-constexpr int D_Q = 576;                // Query/Key 总维度 (NoPE + RoPE)
-constexpr int D_K = 576;                // Key 总维度
-constexpr int D_V = 512;                // Value/Output 维度 (NoPE 部分)
-constexpr int D_ROPE = 64;              // RoPE 维度 (D_tail)
-constexpr float MAX_INIT_VAL = -1e30;   // 用于避免 -inf - (-inf) = nan
+
+// Q NoPE Layout: [B_H, D_V] = [64, 512]
+using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_V>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// Q RoPE Layout: [B_H, D_ROPE] = [64, 64]
+using SmemLayoutQRoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_ROPE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// Q NoPE 用于 TiledMMA 的 Layout: [B_H, D_V] = [64, 512]
+// 与 SmemLayoutQNoPE 相同，用于 Dual GEMM
+using SmemLayoutQNoPE_TiledMMA = SmemLayoutQNoPE;
+
+// Q RoPE 用于 TiledMMA 的 Layout: [B_H*2, D_ROPE/2] = [128, 32]
+// 用于 Dual GEMM 的 Q RoPE 视图
+using SmemLayoutQRoPE_TiledMMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_H*2>, Int<D_ROPE/2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// KV NoPE Layout: [B_TOPK, D_V] = [32, 512]
+using SmemLayoutKVNoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_TOPK>, Int<D_V>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// KV RoPE Layout: [B_TOPK, D_ROPE] = [32, 64]
+using SmemLayoutKVRoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_TOPK>, Int<D_ROPE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// KV NoPE 用于 TiledMMA 的 Layout: [B_TOPK*2, D_V/2] = [64, 256]
+// 用于 Implicit Dual GEMM
+using SmemLayoutKVNoPE_TiledMMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_TOPK*2>, Int<D_V/2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// KV RoPE 用于 TiledMMA 的 Layout: [B_TOPK*2, D_ROPE/2] = [64, 32]
+using SmemLayoutKVRoPE_TiledMMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_TOPK*2>, Int<D_ROPE/2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// dO Layout: [B_H, D_V] = [64, 512]
+using SmemLayoutdO = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_V>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// dQ NoPE Layout: [B_H, D_V] = [64, 512]
+using SmemLayoutdQNoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_V>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// dQ RoPE Layout: [B_H, D_ROPE] = [64, 64]
+using SmemLayoutdQRoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_ROPE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+// S/dS 矩阵 Layout: [B_H, B_TOPK] = [64, 32]
+using SmemLayoutS = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_INTER_Atom<bf16>{},
+    Shape<Int<B_H>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
 // ============================================================================
-// 分块参数
+// TiledMMA 定义
 // ============================================================================
-constexpr int B_H = 64;                 // Head 分块大小 (block_H)
-constexpr int B_TOPK = 32;              // TopK 分块大小 (BS/block_size)
-constexpr int NUM_BUFS = 2;             // KV 缓冲区数量
-constexpr int NUM_THREADS = 384;        // 线程数
-constexpr int SPLIT_STORE = 2;          // dKV 分批写入因子
+
+// TiledMMA_P: 用于计算 P = Q @ K^T
+// 使用 Dual GEMM, N = 2*B_TOPK = 64
+// 指令: utcmma_ss (SMEM-SMEM)
+using TiledMMA_P = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK*2, UMMA::Major::K, UMMA::Major::K>{}
+));
+
+// TiledMMA_dV: 用于计算 dV = P^T @ dO (分块处理，每次 N=256)
+// 指令: utcmma_ss (SMEM-SMEM)
+// 由于 D_V=512 > 256，需要分两次计算
+using TiledMMA_dV = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_V/2, UMMA::Major::MN, UMMA::Major::K>{}
+));
+
+// TiledMMA_dK: 用于计算 dK = dP^T @ Q (分块处理，每次 N=256)
+// 指令: utcmma_ss (SMEM-SMEM)
+// 由于 D_V=512 > 256，需要分两次计算
+using TiledMMA_dK = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_V/2, UMMA::Major::MN, UMMA::Major::K>{}
+));
+
+// TiledMMA_dQ: 用于计算 dQ = dP @ K (分块处理，每次 N=256)
+// 指令: utcmma_ss (SMEM-SMEM)
+// 由于 D_V=512 > 256，需要分两次计算
+using TiledMMA_dQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, D_V/2, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+// ============================================================================
+// Named Barriers 枚举
+// ============================================================================
+enum NamedBarriers : int {
+    wg0_sync = 0,
+    wg0_warp02_sync = 1,
+    wg0_warp13_sync = 2,
+    wg1_sync = 3,
+    wg2_sync = 4,
+    pepi_sync = 5,
+};
 
 // ============================================================================
 // TMEM 列映射
@@ -73,8 +193,7 @@ namespace tmem_cols {
     // dKV NoPE 累加器: dKey/dValue 梯度累加 (NoPE 部分)
     // 由于 MMA N=256 限制，分成两部分存储
     // Shape: [B_TOPK, 256] × 2 = [32, 512], 每部分需要 256*32/128 = 64 列
-    constexpr int dKV = 32;           // dKV_part0: 32~96
-    constexpr int dKV_part1 = 96;     // dKV_part1: 96~160
+    constexpr int dKV = 32;           // dKV_part0: 32~160
     
     // dKV RoPE 累加器: dKey/dValue 梯度累加 (RoPE 部分)
     // Shape: [B_TOPK, D_ROPE] = [32, 64], 需要 64*32/128 = 16 列
@@ -83,106 +202,13 @@ namespace tmem_cols {
     // dQ NoPE 累加器: dQuery 梯度累加 (NoPE 部分)
     // 由于 MMA N=256 限制，分成两部分存储
     // Shape: [B_H, 256] × 2 = [64, 512], 每部分需要 256*64/128 = 128 列
-    constexpr int dQ = 176;           // dQ_part0: 176~304
-    constexpr int dQ_part1 = 304;     // dQ_part1: 304~432
+    constexpr int dQ = 176;           // dQ_part0: 176~432
     
     // dQ RoPE 累加器: dQuery 梯度累加 (RoPE 部分)
     // Shape: [B_H, D_ROPE] = [64, 64], 需要 64*64/128 = 32 列
     constexpr int dQ_RoPE = 432;      // dQ_RoPE: 432~464
 }
 
-// ============================================================================
-// Shared Memory 布局定义
-// 参考前向 config.h 的布局风格，使用 CUTE 的 swizzle 布局
-// ============================================================================
-
-// Q NoPE 部分布局: [B_H, D_V] = [64, 512], SW128
-using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_H>, Int<D_V>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// Q RoPE 部分布局: [B_H, D_ROPE] = [64, 64], SW64
-using SmemLayoutQRoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW64_Atom<bf16>{},
-    Shape<Int<B_H>, Int<D_ROPE>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// dO 布局: [B_H, D_V] = [64, 512], SW128
-using SmemLayoutdO = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_H>, Int<D_V>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// KV NoPE 部分布局: [B_TOPK, D_V] = [32, 512], SW128
-template<int NUM_TILES>
-using SmemLayoutKVNoPETiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_TOPK>, Int<64*NUM_TILES>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-using SmemLayoutKVNoPE = SmemLayoutKVNoPETiles<8>;  // 8 tiles = 512
-
-// KV NoPE 转置布局 (用于 S×V 计算): [D_V, B_TOPK]
-using SmemLayoutV = decltype(coalesce(
-    composition(
-        SmemLayoutKVNoPE{},
-        Layout<Shape<Int<D_V>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
-    )
-, Shape<_1, _1>{}));
-
-// KV RoPE 部分布局: [B_TOPK, D_ROPE] = [32, 64], SW64
-using SmemLayoutKVRoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW64_Atom<bf16>{},
-    Shape<Int<B_TOPK>, Int<D_ROPE>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// ============================================================================
-// 分块计算布局 (用于支持 N=256 的 MMA 分次累加)
-// 参考前向 config.h 的 SmemLayoutKNoPE_TiledMMA
-// ============================================================================
-
-// KV NoPE 分块布局 (用于 dQ 计算): [B_TOPK, D_V/2] = [32, 256]
-// 将 [32, 512] 的 KV_nope 分成两个 [32, 256] 的块进行计算
-using SmemLayoutKVNoPE_TiledMMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_TOPK>, Int<D_V/2>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// Q/dO NoPE 分块布局 (用于 dKV 计算): [B_H, D_V/2] = [64, 256]
-// 将 [64, 512] 的 Q_nope/dO 分成两个 [64, 256] 的块进行计算
-using SmemLayoutQNoPE_TiledMMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_H>, Int<D_V/2>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// S/dS 矩阵布局 (P_shared_cast, dP_shared_cast): [B_H, B_TOPK] = [64, 32], INTER
-using SmemLayoutS = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_INTER_Atom<bf16>{},
-    Shape<Int<B_H>, Int<B_TOPK>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// dQ 输出布局: [B_H, D_V] = [64, 512], SW128
-using SmemLayoutdQNoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_H>, Int<D_V>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
-
-// dQ RoPE 输出布局: [B_H, D_ROPE] = [64, 64], SW64
-using SmemLayoutdQRoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW64_Atom<bf16>{},
-    Shape<Int<B_H>, Int<D_ROPE>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
 
 // ============================================================================
 // Shared Memory 规划结构体
@@ -270,70 +296,5 @@ struct SharedMemoryPlan {
     float rowwise_li_buf[128];                  // log-sum-exp
     float rowwise_delta_buf[128];               // Delta = sum(O * dO)
 };
-
-// ============================================================================
-// TiledMMA 定义
-// 反向传播需要多种 GEMM 配置，所有 MMA 都使用 utcmma_ss (SMEM-SMEM)
-// ============================================================================
-
-// P/dP 矩阵计算 MMA: Q×K^T → P, dO×K^T → dP
-// Shape: [B_H, B_TOPK] = [64, 32]
-// 输入: A (Q/dO) 在 SMEM [64, 512], Major::K
-//       B (K^T) 在 SMEM [32, 512]^T, Major::MN (转置后 K 沿 M 维度连续)
-// 输出: TMEM P/dP [64, 32]
-// 注意: 使用 SS_NOELECT (非 WS 版本) 以支持 N=32 (WS_SS_NOELECT 只支持 N>=64)
-using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
-));
-
-// dKV 计算 MMA: S^T×dO → dKV, ds^T×Q → dKV
-// Shape: [B_TOPK, 256] (原 [32, 512]，分两次累加)
-// 输入: A (S^T/ds^T) 在 SMEM [64, 32]^T, Major::MN (转置后 S 沿 M 维度连续)
-//       B (dO/Q) 在 SMEM [64, 256] (分块), Major::K
-// 输出: TMEM dKV [32, 256] (分两部分存储)
-// 注意: N=512 超出 WS_SS_NOELECT 支持范围 (最大 256)，需要分两次累加
-using TiledMMA_dKV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::MN, UMMA::Major::K>{}
-));
-
-// dKV_RoPE 计算 MMA: ds^T×Q_rope → dKV_RoPE
-// Shape: [B_TOPK, D_ROPE] = [32, 64]
-// 输入: A (ds^T) 在 SMEM [64, 32]^T, Major::MN
-//       B (Q_rope) 在 SMEM [64, 64], Major::K
-// 输出: TMEM dKV_RoPE [32, 64]
-using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::MN, UMMA::Major::K>{}
-));
-
-// dQ 计算 MMA: ds×K → dQ
-// Shape: [B_H, 256] (原 [64, 512]，分两次累加)
-// 输入: A (ds) 在 SMEM [64, 32], Major::K
-//       B (K) 在 SMEM [32, 256] (分块), Major::K
-// 输出: TMEM dQ [64, 256] (分两部分存储)
-// 注意: N=512 超出 WS_SS_NOELECT 支持范围 (最大 256)，需要分两次累加
-using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::K>{}
-));
-
-// dQ_RoPE 计算 MMA: ds×K_rope → dQ_RoPE
-// Shape: [B_H, D_ROPE] = [64, 64]
-// 输入: A (ds) 在 SMEM [64, 32], Major::K
-//       B (K_rope) 在 SMEM [32, 64], Major::K
-// 输出: TMEM dQ_RoPE [64, 64]
-using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::K, UMMA::Major::K>{}
-));
-
-// ============================================================================
-// Named Barriers 枚举
-// ============================================================================
-enum NamedBarriers : int {
-    wg0_sync = 0,           // Warp Group 0 同步
-    wg0_warp02_sync = 1,    // Warp 0,2 同步
-    wg0_warp13_sync = 2,    // Warp 1,3 同步
-    pepi_sync = 3,          // Prologue-Epilogue 同步
-    dkv_sync = 4,           // dKV 写入同步
-};
-
 
 }  // namespace sm100::bwd::head64
