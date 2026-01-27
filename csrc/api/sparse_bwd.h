@@ -4,7 +4,7 @@
 
 #include "params.h"
 
-#include "sm100/prefill/sparse/bwd/head64/phase1.h"
+#include "sm100/prefill/sparse/bwd/head128/phase1.h"
 
 // 反向传播特性枚举
 enum class BwdFeatures : int {
@@ -35,7 +35,7 @@ class Bwd_Sm100_Head64_Impl : public BwdImplBase {
 protected:
     void run_(const SparseAttnBwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::bwd::head64::run_bwd_phase1_kernel<HEAD_DIM_QK>(params);
+            sm100::bwd::head128::run_bwd_phase1_kernel<HEAD_DIM_QK>(params);
         });
     }
 };
