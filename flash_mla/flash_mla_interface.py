@@ -228,7 +228,7 @@ def flash_mla_sparse_bwd(
     sm_scale: float,
     d_v: int = 512,
     topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention backward kernel
 
@@ -244,9 +244,10 @@ def flash_mla_sparse_bwd(
         topk_length: optional, [s_q], int32 - 可选的TopK长度
 
     Returns:
-        (dQ, dKV)
+        (dQ, dKV, delta)
         - dQ: [s_q, h_q, d_qk], bfloat16 - Query梯度
         - dKV: [s_kv, h_kv, d_qk], bfloat16 - KV梯度
+        - delta: [s_q, h_q], float32 - Delta = sum(O * dO, dim=-1)
     """
     results = flash_mla_cuda.sparse_prefill_bwd(
         q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length

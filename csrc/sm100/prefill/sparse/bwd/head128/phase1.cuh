@@ -315,6 +315,10 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
                 delta += __bfloat162float(o_vec.a67.x) * __bfloat162float(do_vec.a67.x);
                 delta += __bfloat162float(o_vec.a67.y) * __bfloat162float(do_vec.a67.y);
             }
+
+            // Write delta to global memory
+            float* gDelta = params.delta + s_q_idx * params.stride_delta_s_q + global_row_idx * params.stride_delta_h_q;
+            *gDelta = delta;
             
             // Write delta to shared memory buffer (using local_row_idx)
             plan.rowwise_delta_buf[local_row_idx] = delta;

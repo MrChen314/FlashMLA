@@ -51,7 +51,7 @@ protected:
  * @param sm_scale Softmax缩放因子
  * @param d_v Value维度 (512)
  * @param topk_length 可选的TopK长度 [s_q], int32
- * @return std::vector<at::Tensor> {dQ, dKV}
+ * @return std::vector<at::Tensor> {dQ, dKV, delta}
  */
 static std::vector<at::Tensor> sparse_attn_bwd_interface(
     const at::Tensor &q,
@@ -128,8 +128,10 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
 
     at::Tensor dQ = torch::empty({s_q, h_q, d_qk}, opts);
     at::Tensor dKV = torch::zeros({s_kv, h_kv, d_qk}, opts.dtype(torch::kFloat32));  // float32累加
+    at::Tensor delta = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat32));  // Delta = sum(O * dO, dim=-1)
     KU_CHECK_CONTIGUOUS(dQ);
     KU_CHECK_CONTIGUOUS(dKV);
+    KU_CHECK_CONTIGUOUS(delta);
 
     SparseAttnBwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
@@ -154,8 +156,10 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
         // 输出张量
         (bf16*)dQ.data_ptr(),
         (float*)dKV.data_ptr(),
+        (float*)delta.data_ptr(),
         int64_stride_to_int(dQ.stride(0)), int64_stride_to_int(dQ.stride(1)),
         int64_stride_to_int(dKV.stride(0)), int64_stride_to_int(dKV.stride(1)),
+        int64_stride_to_int(delta.stride(0)), int64_stride_to_int(delta.stride(1)),
 
         arch.num_sms,
         at::cuda::getCurrentCUDAStream().stream()
@@ -194,5 +198,5 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     // 将 dKV 从 float32 转换为 bfloat16
     at::Tensor dKV_bf16 = dKV.to(torch::kBFloat16);
 
-    return {dQ, dKV_bf16};
+    return {dQ, dKV_bf16, delta};
 }

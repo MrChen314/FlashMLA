@@ -191,8 +191,10 @@ struct SparseAttnBwdParams {
     // 输出张量
     cutlass::bfloat16_t* __restrict__ dQ;    // [s_q, h_q, d_qk] Query梯度
     float* __restrict__ dKV;                 // [s_kv, h_kv, d_qk] KV梯度 (float32累加)
+    float* __restrict__ delta;               // [s_q, h_q] Delta = sum(O * dO, dim=-1)
     int stride_dQ_s_q; int stride_dQ_h_q;
     int stride_dKV_s_kv; int stride_dKV_h_kv;
+    int stride_delta_s_q; int stride_delta_h_q;
 
     int num_sm;
     cudaStream_t stream;
