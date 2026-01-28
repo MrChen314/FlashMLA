@@ -99,7 +99,6 @@ ext_modules.append(
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
 
             # sm100 sparse prefill backward
-            "csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k512.cu",
             "csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k576.cu",
 
             # sm100 sparse decode

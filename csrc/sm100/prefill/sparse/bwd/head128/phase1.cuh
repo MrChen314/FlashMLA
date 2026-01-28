@@ -345,7 +345,7 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
  */
 template<typename Kernel, typename TmaParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 2)
-sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params, 
+sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, 
                               __grid_constant__ const TmaParams tma_params) {
     Kernel::sparse_attn_bwd_kernel_devfunc(params, tma_params);
 }
@@ -458,7 +458,7 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     };
     
     // Use kernel instantiated from KernelTemplate (consistent with forward propagation)
-    auto kernel = &sparse_attn_bwd_kernel_part0<Kernel, decltype(tma_params)>;
+    auto kernel = &sparse_attn_bwd_kernel<Kernel, decltype(tma_params)>;
 
     // === Configure and launch kernel with cluster (2CTA mode) ===
     constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);  // Dynamic shared memory size
