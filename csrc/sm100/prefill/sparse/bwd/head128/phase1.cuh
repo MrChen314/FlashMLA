@@ -352,7 +352,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params,
 
 /**
  * @brief Host wrapper function to launch backward Phase1 kernel (2CTA Mode)
- * @tparam D_QK Query/Key dimension (576 or 512)
+ * @tparam D_QK Query/Key dimension (576)
  * @param params Attention computation parameter struct
  * 
  * Functionality:
@@ -366,7 +366,7 @@ sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params,
  */
 template<int D_QK>
 void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
-    static_assert(D_QK == 576 || D_QK == 512);  // Only support these two QK dimensions
+    static_assert(D_QK == 576);  // Only support D_QK == 576 for backward kernel
     using Kernel = KernelTemplate<D_QK>;
 
     // === Parameter validation ===

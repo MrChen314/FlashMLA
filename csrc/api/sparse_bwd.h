@@ -31,9 +31,8 @@ class Bwd_Sm100_Head128Impl : public BwdImplBase {
 
 protected:
     void run_(const SparseAttnBwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::bwd::head128::run_bwd_phase1_kernel<HEAD_DIM_QK>(params);
-        });
+        // Only support D_QK == 576 for backward kernel
+        sm100::bwd::head128::run_bwd_phase1_kernel<576>(params);
     }
 };
 
