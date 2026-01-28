@@ -11,7 +11,6 @@ enum class BwdFeatures : int {
     HEAD_128,
 
     HEAD_DIM_576,
-    HEAD_DIM_512,
 
     TOPK_LENGTH
 };
@@ -22,11 +21,10 @@ class BwdImplBase : public ImplBase<
     BwdFeatures
 > {};
 
-// SM100 Head64 反向实现
+// SM100 Head128 反向实现
 class Bwd_Sm100_Head128Impl : public BwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         BwdFeatures::HEAD_128,
-        BwdFeatures::HEAD_DIM_512,
         BwdFeatures::HEAD_DIM_576,
         BwdFeatures::TOPK_LENGTH
     )
@@ -87,7 +85,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
 
-    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
+    TORCH_CHECK(d_qk == 576, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v: ", d_v);
 
     KU_CHECK_DEVICE(q);
@@ -174,8 +172,6 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     }
     if (d_qk == 576) {
         required_features.push_back(BwdFeatures::HEAD_DIM_576);
-    } else if (d_qk == 512) {
-        required_features.push_back(BwdFeatures::HEAD_DIM_512);
     } else {
         TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
     }
@@ -183,7 +179,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
         required_features.push_back(BwdFeatures::TOPK_LENGTH);
     }
 
-    // 目前只支持 SM100 Head64
+    // 目前只支持 SM100 Head128
     if (is_sm100f) {
         if (h_q == 128) {
             Bwd_Sm100_Head128Impl bwd_impl;
