@@ -29,7 +29,7 @@ struct TmaParams {
 // KernelTemplate 模板类: 与正向传播保持一致的结构
 // 通过 D_QK 模板参数控制维度和是否启用 RoPE
 // D_QK == 576: 启用 RoPE (576 = 512 + 64)
-// D_QK == 512: 禁用 RoPE
+// Note: Only D_QK == 576 is supported for backward kernel
 // ============================================================================
 template<int D_QK>
 struct KernelTemplate {
@@ -40,7 +40,7 @@ struct KernelTemplate {
 static constexpr int D_Q = D_QK;                    // Query 维度
 static constexpr int D_K = D_QK;                    // Key 维度  
 static constexpr int D_V = 512;                     // Value/NoPE 维度
-static constexpr int D_ROPE = D_Q - D_V;            // RoPE 维度 = 64 (当 D_QK=576) 或 0 (当 D_QK=512)
+static constexpr int D_ROPE = D_Q - D_V;            // RoPE 维度 = 64 (当 D_QK=576)
 static constexpr float MAX_INIT_VAL = -1e30f;       // 用于 max logits 初始化
 static constexpr bool HAVE_ROPE = (D_QK == 576);    // 是否启用 RoPE
 
@@ -293,7 +293,7 @@ struct SharedMemoryPlan {
 // ============================================================================
 template<typename TmaParams>
 static __device__ void
-sparse_attn_bwd_kernel_part0_devfunc(const SparseAttnBwdParams &params, const TmaParams &tma_params);
+sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &params, const TmaParams &tma_params);
 
 };  // struct KernelTemplate
 

@@ -109,7 +109,7 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
             plan.bar_prologue_dO.init(1);
             plan.bar_prologue_utccp.init(1);
             
-            // 单缓冲模式初始化 (调试模式：禁用双缓冲)
+            // Single buffer mode initialization (debug mode: disable double buffering)
             plan.bar_qk_done[0].init(1);
             plan.bar_sv_part_done[0].init(1);
             plan.bar_sv_done[0].init(1);
@@ -127,7 +127,7 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
 
     if (warp_idx == 0) {
         if (elect_one_sync()) {
-            // Copy Q (包含 NoPE 和 RoPE)
+            // Copy Q (including NoPE and RoPE)
             Tensor gQ = flat_divide(
                 tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
@@ -173,19 +173,19 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
                     min_indices = min(min_indices, int4_min(indices[local_row]));
                 }
                 bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
-                // 单缓冲模式：k >= 1 时可以跳过无效行
+                // Single buffer mode: can skip invalid rows when k >= 1
                 bool should_skip_tma = is_all_rows_invalid && k >= 1;
 
-                // 单缓冲模式：始终使用 buffer 0
+                // Single buffer mode: always use buffer 0
                 constexpr int cur_buf = 0;
 
-                // --- Wait for previous QK^T to complete (单缓冲模式) ---
+                // --- Wait for previous QK^T to complete (single buffer mode) ---
                 if (k > 0) {
                     plan.bar_qk_done[0].wait((k-1) & 1);
                 }
 
                 // --- Load full KV data using TMA gather (2CTA) ---
-                // 加载完整的 KV 数据 (D_Q=576 列，包含 NoPE 512 + RoPE 64)
+                // Load complete KV data (D_Q=576 columns, including NoPE 512 + RoPE 64)
                 auto load_kv = [&](transac_bar_t &bar) {
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -203,13 +203,16 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
                     }
                 };
 
-                // 单缓冲模式：始终使用 bar_kv_ready[0]
+                // Single buffer mode: always use bar_kv_ready[0]
                 if (!should_skip_tma) {
                     load_kv(plan.bar_kv_ready[0]);
                 } else {
                     plan.bar_kv_ready[0].complete_transaction(0u, NUM_LOCAL_ROWS_PER_WARP*4*D_Q*sizeof(bf16), 1u);
                 }
             }
+        }
+        if (warp_idx == 0) {
+            cute::TMEM::Allocator2Sm().free(0, 512);
         }
 
     // ========================================
@@ -220,44 +223,44 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
         // === CTA0 Warp 4: MMA control warp (only CTA0 initiates MMA in 2CTA mode) ===
         if (cta_idx == 0 && warp_idx == 4 && elect_one_sync()) {
             // Wait for Q load to complete (2CTA: each CTA loads B_H/2 rows)
-            plan.bar_prologue_q.arrive_and_expect_tx((B_H/2)*D_Q*sizeof(bf16));
+            plan.bar_prologue_q.arrive_and_expect_tx((B_H)*D_Q*sizeof(bf16));
             plan.bar_prologue_q.wait(0);
             ku::tcgen05_after_thread_sync();
 
-            // --- Main computation loop (单缓冲模式，方便调试) ---
+            // --- Main computation loop (single buffer mode, convenient for debugging) ---
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
-                // 单缓冲模式：始终使用 buffer 0
+                // Single buffer mode: always use buffer 0
                 constexpr int cur_buf = 0;
 
-                // --- Build SMEM tensor views for Q and KV (每次循环重新加载) ---
-                // 使用函数开头定义的完整 sQ: [B_H/2, D_Q] = [64, 576]
-                // sQ 已经在第94行定义: Tensor sQ = make_tensor(make_smem_ptr(plan.u.q_kv.q.data()), SmemLayoutQ{});
+                // --- Build SMEM tensor views for Q and KV (reload each iteration) ---
+                // Use the complete sQ defined at function start: [B_H/2, D_Q] = [64, 576]
+                // sQ is already defined at line 94: Tensor sQ = make_tensor(make_smem_ptr(plan.u.q_kv.q.data()), SmemLayoutQ{});
                 
-                // KV 完整 tensor: [B_TOPK/2, D_Q] = [32, 576]
+                // KV complete tensor: [B_TOPK/2, D_Q] = [32, 576]
                 Tensor sKV = make_tensor(
                     make_smem_ptr(plan.u.q_kv.kv.data()),
                     SmemLayoutKV{}
                 );
 
-                // Wait for P matrix buffer to be available (2CTA sync，单缓冲模式)
-                if (k > 0) {
-                    plan.bar_p_free[0].wait((k-1) & 1);
-                }
+                // Wait for P matrix buffer to be available (2CTA sync, single buffer mode)
+                // if (k > 0) {
+                //     plan.bar_p_free[0].wait((k-1) & 1);
+                // }
                 ku::tcgen05_after_thread_sync();
 
                 // ================================================================
-                // P = Q @ K^T (2CTA, 一次性计算完整的 D_Q=576 维度)
+                // P = Q @ K^T (2CTA, compute complete D_Q=576 dimensions in one pass)
                 // Q: [64, 576], K: [32, 576]
                 // 2CTA cooperation: P: [B_H/2, B_TOPK] = [64, 64] (both CTAs complete together)
                 // ================================================================
                 
-                // Wait for KV data to be ready (单缓冲模式)
-                plan.bar_kv_ready[0].arrive_and_expect_tx((B_TOPK/2)*D_Q*sizeof(bf16));
+                // Wait for KV data to be ready (single buffer mode)
+                plan.bar_kv_ready[0].arrive_and_expect_tx((B_TOPK)*D_Q*sizeof(bf16));
                 plan.bar_kv_ready[0].wait(k & 1);
                 ku::tcgen05_after_thread_sync();
 
-                // P = Q @ K^T (一次性计算完整的 NoPE + RoPE)
+                // P = Q @ K^T (compute complete NoPE + RoPE in one pass)
                 ku::utcmma_ss(
                     tiled_mma_P,
                     sQ,
@@ -265,7 +268,7 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
                     tP,
                     true  // Clear accumulator
                 );
-                // Notify QK^T completion (2CTA multicast，单缓冲模式)
+                // Notify QK^T completion (2CTA multicast, single buffer mode)
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_qk_done[0], 1|2);
             }
         }
@@ -276,9 +279,12 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
     // Each CTA computes delta for B_H/2=64 rows
     // ========================================
     } else if (warpgroup_idx == 2) {
-        // Wait for dO load to complete (2CTA: each CTA loads B_H/2=64 rows)
-        plan.bar_prologue_dO.arrive_and_expect_tx((B_H/2)*D_V*sizeof(bf16));
-        plan.bar_prologue_dO.wait(0);
+        if (cta_idx == 0 && warp_idx == 8 && elect_one_sync()) {
+            plan.bar_prologue_dO.arrive_and_expect_tx((B_H)*D_V*sizeof(bf16));
+            plan.bar_prologue_dO.wait(0);
+            ku::tcgen05_after_thread_sync();
+        }
+        __syncthreads();
 
         // Delta computation: delta[i] = sum_j(O[i,j] * dO[i,j])
         // 2CTA mode: each thread processes one row, each CTA processes B_H/2=64 rows
@@ -288,9 +294,9 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
             const int global_row_idx = cta_idx * (B_H/2) + local_row_idx;
             
             // Read O from global memory (forward output)
-            const bf16* gO = params.o + s_q_idx * params.stride_o_s_q + global_row_idx * params.d_v;
+            const bf16* gO = params.o + s_q_idx * params.stride_o_s_q + global_row_idx * params.stride_o_h_q;
             
-            // 使用函数开头定义的 sdO (不重复定义)
+            // Use sdO defined at function start (do not redefine)
             float delta = 0.0f;
             
             // Accumulate O * dO using vectorized loads
@@ -315,6 +321,10 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
                 delta += __bfloat162float(o_vec.a67.x) * __bfloat162float(do_vec.a67.x);
                 delta += __bfloat162float(o_vec.a67.y) * __bfloat162float(do_vec.a67.y);
             }
+
+            // Write delta to global memory
+            float* gDelta = params.delta + s_q_idx * params.stride_delta_s_q + global_row_idx * params.stride_delta_h_q;
+            *gDelta = delta;
             
             // Write delta to shared memory buffer (using local_row_idx)
             plan.rowwise_delta_buf[local_row_idx] = delta;
@@ -333,22 +343,22 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
 }
 
 /**
- * @brief Global Kernel Wrapper Function (与正向传播保持一致的结构)
- * @tparam Kernel KernelTemplate 实例化类型
- * @tparam TmaParams TMA 参数类型
- * @param params Attention 计算参数
- * @param tma_params TMA 描述符参数
+ * @brief Global Kernel Wrapper Function (consistent structure with forward propagation)
+ * @tparam Kernel KernelTemplate instantiation type
+ * @tparam TmaParams TMA parameter type
+ * @param params Attention computation parameters
+ * @param tma_params TMA descriptor parameters
  */
 template<typename Kernel, typename TmaParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 2)
-sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params, 
+sparse_attn_bwd_kernel(__grid_constant__ const SparseAttnBwdParams params, 
                               __grid_constant__ const TmaParams tma_params) {
     Kernel::sparse_attn_bwd_kernel_devfunc(params, tma_params);
 }
 
 /**
  * @brief Host wrapper function to launch backward Phase1 kernel (2CTA Mode)
- * @tparam D_QK Query/Key dimension (576 or 512)
+ * @tparam D_QK Query/Key dimension (576)
  * @param params Attention computation parameter struct
  * 
  * Functionality:
@@ -362,7 +372,7 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
  */
 template<int D_QK>
 void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
-    static_assert(D_QK == 576 || D_QK == 512);  // Only support these two QK dimensions
+    static_assert(D_QK == 576);  // Only support D_QK == 576 for backward kernel
     using Kernel = KernelTemplate<D_QK>;
 
     // === Parameter validation ===
@@ -372,7 +382,7 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     KU_ASSERT(params.d_qk == D_QK);
 
     // === Create TMA descriptor for Q (2SM mode) ===
-    // Q shape: [h_q, d_qk, s_q] = [h_q, 576, s_q] (包含 NoPE 512 + RoPE 64)
+    // Q shape: [h_q, d_qk, s_q] = [h_q, 576, s_q] (including NoPE 512 + RoPE 64)
     auto shape_Q = make_shape(params.h_q, Kernel::D_Q, params.s_q);
     auto tma_Q = cute::make_tma_copy(
         SM100_TMA_2SM_LOAD_NOSPLIT{},  // 2SM TMA for cluster
@@ -417,7 +427,7 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     );
 
     // === Create TensorMap for KV (for TMA gather) ===
-    // KV shape: [d_qk, s_kv] = [576, s_kv] (包含 NoPE 512 + RoPE 64)
+    // KV shape: [d_qk, s_kv] = [576, s_kv] (including NoPE 512 + RoPE 64)
     CUtensorMap tensor_map_kv;
     {
         uint64_t size[2] = {Kernel::D_Q, (unsigned long)params.s_kv};  // [d_qk, s_kv]
@@ -453,8 +463,8 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
         tensor_map_kv
     };
     
-    // 使用 KernelTemplate 实例化的 kernel (与正向传播保持一致)
-    auto kernel = &sparse_attn_bwd_kernel_part0<Kernel, decltype(tma_params)>;
+    // Use kernel instantiated from KernelTemplate (consistent with forward propagation)
+    auto kernel = &sparse_attn_bwd_kernel<Kernel, decltype(tma_params)>;
 
     // === Configure and launch kernel with cluster (2CTA mode) ===
     constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);  // Dynamic shared memory size

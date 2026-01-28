@@ -11,7 +11,6 @@ enum class BwdFeatures : int {
     HEAD_128,
 
     HEAD_DIM_576,
-    HEAD_DIM_512,
 
     TOPK_LENGTH
 };
@@ -22,20 +21,18 @@ class BwdImplBase : public ImplBase<
     BwdFeatures
 > {};
 
-// SM100 Head64 反向实现
+// SM100 Head128 反向实现
 class Bwd_Sm100_Head128Impl : public BwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         BwdFeatures::HEAD_128,
-        BwdFeatures::HEAD_DIM_512,
         BwdFeatures::HEAD_DIM_576,
         BwdFeatures::TOPK_LENGTH
     )
 
 protected:
     void run_(const SparseAttnBwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::bwd::head128::run_bwd_phase1_kernel<HEAD_DIM_QK>(params);
-        });
+        // Only support D_QK == 576 for backward kernel
+        sm100::bwd::head128::run_bwd_phase1_kernel<576>(params);
     }
 };
 
@@ -51,7 +48,7 @@ protected:
  * @param sm_scale Softmax缩放因子
  * @param d_v Value维度 (512)
  * @param topk_length 可选的TopK长度 [s_q], int32
- * @return std::vector<at::Tensor> {dQ, dKV}
+ * @return std::vector<at::Tensor> {dQ, dKV, delta}
  */
 static std::vector<at::Tensor> sparse_attn_bwd_interface(
     const at::Tensor &q,
@@ -87,7 +84,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
 
-    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
+    TORCH_CHECK(d_qk == 576, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v: ", d_v);
 
     KU_CHECK_DEVICE(q);
@@ -128,8 +125,10 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
 
     at::Tensor dQ = torch::empty({s_q, h_q, d_qk}, opts);
     at::Tensor dKV = torch::zeros({s_kv, h_kv, d_qk}, opts.dtype(torch::kFloat32));  // float32累加
+    at::Tensor delta = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat32));  // Delta = sum(O * dO, dim=-1)
     KU_CHECK_CONTIGUOUS(dQ);
     KU_CHECK_CONTIGUOUS(dKV);
+    KU_CHECK_CONTIGUOUS(delta);
 
     SparseAttnBwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
@@ -154,8 +153,10 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
         // 输出张量
         (bf16*)dQ.data_ptr(),
         (float*)dKV.data_ptr(),
+        (float*)delta.data_ptr(),
         int64_stride_to_int(dQ.stride(0)), int64_stride_to_int(dQ.stride(1)),
         int64_stride_to_int(dKV.stride(0)), int64_stride_to_int(dKV.stride(1)),
+        int64_stride_to_int(delta.stride(0)), int64_stride_to_int(delta.stride(1)),
 
         arch.num_sms,
         at::cuda::getCurrentCUDAStream().stream()
@@ -170,8 +171,6 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     }
     if (d_qk == 576) {
         required_features.push_back(BwdFeatures::HEAD_DIM_576);
-    } else if (d_qk == 512) {
-        required_features.push_back(BwdFeatures::HEAD_DIM_512);
     } else {
         TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
     }
@@ -179,7 +178,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
         required_features.push_back(BwdFeatures::TOPK_LENGTH);
     }
 
-    // 目前只支持 SM100 Head64
+    // 目前只支持 SM100 Head128
     if (is_sm100f) {
         if (h_q == 128) {
             Bwd_Sm100_Head128Impl bwd_impl;
@@ -194,5 +193,5 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     // 将 dKV 从 float32 转换为 bfloat16
     at::Tensor dKV_bf16 = dKV.to(torch::kBFloat16);
 
-    return {dQ, dKV_bf16};
+    return {dQ, dKV_bf16, delta};
 }
