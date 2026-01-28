@@ -293,7 +293,7 @@ struct SharedMemoryPlan {
 // ============================================================================
 template<typename TmaParams>
 static __device__ void
-sparse_attn_bwd_kernel_part0_devfunc(const SparseAttnBwdParams &params, const TmaParams &tma_params);
+sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &params, const TmaParams &tma_params);
 
 };  // struct KernelTemplate
 
