@@ -23,7 +23,7 @@ constexpr float MAX_INIT_VAL = -1e30f;      // 用于 max logits 初始化
 // ============================================================================
 constexpr int B_H = 128;                     // Query head 块大小 (2CTA 共享，每个 CTA 处理 B_H/2=64 行)
 constexpr int B_TOPK = 64;                  // TopK 块大小 (2CTA 模式每次处理 64 个 topk，每个 CTA 加载 B_TOPK/2=32 行)
-constexpr int NUM_BUFS = 2;                 // KV 双缓冲数量
+constexpr int NUM_BUFS = 1;                 // KV 缓冲数量 (调试模式：禁用双缓冲)
 constexpr int NUM_THREADS = 128 + 128 + 128;  // 3个 WarpGroup，每个128线程
 
 // ============================================================================
@@ -228,7 +228,7 @@ namespace tmem_cols {
 // Shared Memory 规划结构体 (2CTA 版本)
 // 基于 SM100反向资源占用分析.md 的内存复用策略:
 //   2CTA 模式: 每个 CTA 处理 B_H/2 行 Q 和 B_TOPK/2 行 KV
-//   使用双缓冲 (NUM_BUFS=2) 支持流水线
+//   调试模式: 使用单缓冲 (NUM_BUFS=1)，方便定位问题
 // ============================================================================
 struct SharedMemoryPlan {
     // 主联合体: dQ 与 Q+KV 空间复用
@@ -259,11 +259,12 @@ struct SharedMemoryPlan {
     // P 交换缓冲区 (用于 warp 间数据交换, 2CTA 模式)
     float p[(B_H/2)*B_TOPK];
     
-    // KV 有效性掩码 (双缓冲)
+    // KV 有效性掩码 (调试模式：单缓冲)
     char is_kv_valid[NUM_BUFS][B_TOPK/8];
     
     // ========================================================================
     // 同步屏障 (2CTA 同步)
+    // 调试模式: 使用单缓冲 (NUM_BUFS=1)，方便定位问题
     // ========================================================================
     // Prologue 阶段屏障
     transac_bar_t bar_prologue_q_nope;          // Q NoPE TMA 完成
@@ -271,24 +272,24 @@ struct SharedMemoryPlan {
     transac_bar_t bar_prologue_dO;              // dO TMA 完成
     transac_bar_t bar_prologue_utccp;           // Q UTCCP 完成
     
-    // QK^T 计算屏障 (双缓冲, 支持流水线)
+    // QK^T 计算屏障 (单缓冲模式)
     transac_bar_t bar_qk_done[NUM_BUFS];        // P = Q×K^T 完成 (KV 可释放)
     
-    // SV 计算屏障 (双缓冲)
+    // SV 计算屏障 (单缓冲模式)
     transac_bar_t bar_sv_part_done[NUM_BUFS];   // O += S×V 部分完成
     transac_bar_t bar_sv_done[NUM_BUFS];        // O += S×V 完全完成 (V 可释放)
     
-    // KV 就绪屏障 (双缓冲, 不使用 Dual GEMM)
+    // KV 就绪屏障 (单缓冲模式, 不使用 Dual GEMM)
     transac_bar_t bar_kv_nope_ready[NUM_BUFS];        // KV NoPE 完整数据就绪
     transac_bar_t bar_kv_rope_ready[NUM_BUFS];        // KV RoPE 数据就绪
     
-    // P/dP 空闲屏障 (双缓冲)
+    // P/dP 空闲屏障 (单缓冲模式)
     transac_bar_t bar_p_free[NUM_BUFS];         // P 矩阵空闲
     
-    // S/O 就绪屏障 (双缓冲)
+    // S/O 就绪屏障 (单缓冲模式)
     transac_bar_t bar_so_ready[NUM_BUFS];       // S 和 O ready (2CTA 同步)
     
-    // KV 有效性屏障 (双缓冲)
+    // KV 有效性屏障 (单缓冲模式)
     transac_bar_t bar_kv_valid_ready[NUM_BUFS];
     transac_bar_t bar_kv_valid_free[NUM_BUFS];
     

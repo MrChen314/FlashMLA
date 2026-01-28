@@ -8,7 +8,6 @@
 
 // 反向传播特性枚举
 enum class BwdFeatures : int {
-    HEAD_64,
     HEAD_128,
 
     HEAD_DIM_576,
@@ -24,9 +23,9 @@ class BwdImplBase : public ImplBase<
 > {};
 
 // SM100 Head64 反向实现
-class Bwd_Sm100_Head64_Impl : public BwdImplBase {
+class Bwd_Sm100_Head128Impl : public BwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
-        BwdFeatures::HEAD_64,
+        BwdFeatures::HEAD_128,
         BwdFeatures::HEAD_DIM_512,
         BwdFeatures::HEAD_DIM_576,
         BwdFeatures::TOPK_LENGTH
@@ -164,9 +163,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
 
     // 构建特性列表
     std::vector<BwdFeatures> required_features;
-    if (h_q == 64) {
-        required_features.push_back(BwdFeatures::HEAD_64);
-    } else if (h_q == 128) {
+    if (h_q == 128) {
         required_features.push_back(BwdFeatures::HEAD_128);
     } else {
         TORCH_CHECK(false, "Unsupported h_q: ", h_q);
@@ -184,8 +181,8 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
 
     // 目前只支持 SM100 Head64
     if (is_sm100f) {
-        if (h_q == 64) {
-            Bwd_Sm100_Head64_Impl bwd_impl;
+        if (h_q == 128) {
+            Bwd_Sm100_Head128Impl bwd_impl;
             bwd_impl.run(params, required_features);
         } else {
             TORCH_CHECK(false, "Sparse attention backward currently only supports h_q=64. Got h_q=", h_q);

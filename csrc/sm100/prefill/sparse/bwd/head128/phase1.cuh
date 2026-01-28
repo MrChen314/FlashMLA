@@ -130,19 +130,16 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
             plan.bar_prologue_dO.init(1);
             plan.bar_prologue_utccp.init(1);
             
-            // Double buffer barrier initialization (not using Dual GEMM)
-            CUTE_UNROLL
-            for (int i = 0; i < NUM_BUFS; ++i) {
-                plan.bar_qk_done[i].init(1);
-                plan.bar_sv_part_done[i].init(1);
-                plan.bar_sv_done[i].init(1);
-                plan.bar_kv_nope_ready[i].init(1);
-                plan.bar_kv_rope_ready[i].init(1);
-                plan.bar_p_free[i].init(128*2);         // 2CTA sync
-                plan.bar_so_ready[i].init(128*2);       // 2CTA sync
-                plan.bar_kv_valid_ready[i].init(B_TOPK/8);
-                plan.bar_kv_valid_free[i].init(128);
-            }
+            // 单缓冲模式初始化 (调试模式：禁用双缓冲)
+            plan.bar_qk_done[0].init(1);
+            plan.bar_sv_part_done[0].init(1);
+            plan.bar_sv_done[0].init(1);
+            plan.bar_kv_nope_ready[0].init(1);
+            plan.bar_kv_rope_ready[0].init(1);
+            plan.bar_p_free[0].init(128*2);         // 2CTA sync
+            plan.bar_so_ready[0].init(128*2);       // 2CTA sync
+            plan.bar_kv_valid_ready[0].init(B_TOPK/8);
+            plan.bar_kv_valid_free[0].init(128);
             
             fence_barrier_init();
         }
@@ -194,7 +191,7 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
  
     // ========================================
     // Warpgroup 0: Data Loading (WG0) - 2CTA mode
-    // Responsibility: TMA prefetch Q/dO, loop load KV with double buffering
+    // Responsibility: TMA prefetch Q/dO, loop load KV (单缓冲模式，方便调试)
     // Each CTA loads B_TOPK/2 rows of KV data
     // ========================================
     if (warpgroup_idx == 0) {
@@ -219,13 +216,15 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
                     min_indices = min(min_indices, int4_min(indices[local_row]));
                 }
                 bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
-                bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
+                // 单缓冲模式：k >= 1 时可以跳过无效行
+                bool should_skip_tma = is_all_rows_invalid && k >= 1;
 
-                int cur_buf = k % NUM_BUFS;
+                // 单缓冲模式：始终使用 buffer 0
+                constexpr int cur_buf = 0;
 
-                // --- Wait for previous QK^T to complete ---
+                // --- Wait for previous QK^T to complete (单缓冲模式) ---
                 if (k > 0) {
-                    plan.bar_qk_done[(k-1) % NUM_BUFS].wait(((k-1)/NUM_BUFS) & 1);
+                    plan.bar_qk_done[0].wait((k-1) & 1);
                 }
 
                 // --- Load full KV NoPE data using TMA gather (2CTA) ---
@@ -247,10 +246,11 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
                     }
                 };
 
+                // 单缓冲模式：始终使用 bar_kv_nope_ready[0]
                 if (!should_skip_tma) {
-                    load_kv_nope(plan.bar_kv_nope_ready[cur_buf]);
+                    load_kv_nope(plan.bar_kv_nope_ready[0]);
                 } else {
-                    plan.bar_kv_nope_ready[cur_buf].complete_transaction(0u, NUM_LOCAL_ROWS_PER_WARP*4*D_V*sizeof(bf16), 1u);
+                    plan.bar_kv_nope_ready[0].complete_transaction(0u, NUM_LOCAL_ROWS_PER_WARP*4*D_V*sizeof(bf16), 1u);
                 }
             }
         }
@@ -296,14 +296,15 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
             }
             ku::tcgen05_after_thread_sync();
 
-            // --- Main computation loop (double buffering) ---
+            // --- Main computation loop (单缓冲模式，方便调试) ---
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
-                int cur_buf = k % NUM_BUFS;
+                // 单缓冲模式：始终使用 buffer 0
+                constexpr int cur_buf = 0;
 
-                // Wait for P matrix buffer to be available (2CTA sync)
+                // Wait for P matrix buffer to be available (2CTA sync，单缓冲模式)
                 if (k > 0) {
-                    plan.bar_p_free[(k-1) % NUM_BUFS].wait(((k-1)/NUM_BUFS) & 1);
+                    plan.bar_p_free[0].wait((k-1) & 1);
                 }
                 ku::tcgen05_after_thread_sync();
 
@@ -313,9 +314,9 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
                 // 2CTA cooperation: P: [B_H/2, B_TOPK] = [64, 64] (both CTAs complete together)
                 // ================================================================
                 
-                // Wait for KV NoPE data to be ready
-                plan.bar_kv_nope_ready[cur_buf].arrive_and_expect_tx((B_TOPK/2)*D_V*sizeof(bf16));
-                plan.bar_kv_nope_ready[cur_buf].wait((k/NUM_BUFS) & 1);
+                // Wait for KV NoPE data to be ready (单缓冲模式)
+                plan.bar_kv_nope_ready[0].arrive_and_expect_tx((B_TOPK/2)*D_V*sizeof(bf16));
+                plan.bar_kv_nope_ready[0].wait(k & 1);
                 ku::tcgen05_after_thread_sync();
 
                 // P = Q_nope @ K_nope^T
@@ -326,16 +327,16 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
                     tP,
                     true  // Clear accumulator
                 );
-                // Notify QK^T NoPE completion (2CTA multicast)
-                ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_qk_done[cur_buf], 1|2);
+                // Notify QK^T NoPE completion (2CTA multicast，单缓冲模式)
+                ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_qk_done[0], 1|2);
 
                 // ================================================================
                 // P += Q_rope @ K_rope^T (RoPE part)
                 // ================================================================
                 if constexpr (HAVE_ROPE) {
-                    // Wait for KV RoPE data to be ready
-                    plan.bar_kv_rope_ready[cur_buf].arrive_and_expect_tx((B_TOPK/2)*D_ROPE*sizeof(bf16));
-                    plan.bar_kv_rope_ready[cur_buf].wait((k/NUM_BUFS) & 1);
+                    // Wait for KV RoPE data to be ready (单缓冲模式)
+                    plan.bar_kv_rope_ready[0].arrive_and_expect_tx((B_TOPK/2)*D_ROPE*sizeof(bf16));
+                    plan.bar_kv_rope_ready[0].wait(k & 1);
                     ku::tcgen05_after_thread_sync();
 
                     // P += Q_rope @ KV_rope^T
@@ -349,7 +350,7 @@ sparse_attn_bwd_kernel_part0(__grid_constant__ const SparseAttnBwdParams params,
                 }
             }
         }
- 
+
     // ========================================
     // Warpgroup 2: Delta Computation (WG2) - 2CTA mode
     // Compute: delta = sum(O * dO, dim=-1)
