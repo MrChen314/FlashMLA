@@ -279,9 +279,11 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
     // Each CTA computes delta for B_H/2=64 rows
     // ========================================
     } else if (warpgroup_idx == 2) {
-        // Wait for dO load to complete (2CTA: each CTA loads B_H/2=64 rows)
-        plan.bar_prologue_dO.arrive_and_expect_tx((B_H)*D_V*sizeof(bf16));
-        plan.bar_prologue_dO.wait(0);
+        if (cta_idx == 0 && warp_idx == 8 && elect_one_sync()) {
+            plan.bar_prologue_dO.arrive_and_expect_tx((B_H)*D_V*sizeof(bf16));
+            plan.bar_prologue_dO.wait(0);
+            ku::tcgen05_after_thread_sync();
+        }
 
         // Delta computation: delta[i] = sum_j(O[i,j] * dO[i,j])
         // 2CTA mode: each thread processes one row, each CTA processes B_H/2=64 rows
