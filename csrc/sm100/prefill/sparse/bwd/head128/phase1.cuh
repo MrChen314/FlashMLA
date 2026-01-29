@@ -211,6 +211,9 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
                 }
             }
         }
+        if (warp_idx == 0) {
+            cute::TMEM::Allocator2Sm().free(0, 512);
+        }
 
     // ========================================
     // Warpgroup 1: QK^T Computation (WG1) - 2CTA mode
@@ -220,7 +223,7 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
         // === CTA0 Warp 4: MMA control warp (only CTA0 initiates MMA in 2CTA mode) ===
         if (cta_idx == 0 && warp_idx == 4 && elect_one_sync()) {
             // Wait for Q load to complete (2CTA: each CTA loads B_H/2 rows)
-            plan.bar_prologue_q.arrive_and_expect_tx((B_H/2)*D_Q*sizeof(bf16));
+            plan.bar_prologue_q.arrive_and_expect_tx((B_H)*D_Q*sizeof(bf16));
             plan.bar_prologue_q.wait(0);
             ku::tcgen05_after_thread_sync();
 
@@ -277,7 +280,7 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
     // ========================================
     } else if (warpgroup_idx == 2) {
         // Wait for dO load to complete (2CTA: each CTA loads B_H/2=64 rows)
-        plan.bar_prologue_dO.arrive_and_expect_tx((B_H/2)*D_V*sizeof(bf16));
+        plan.bar_prologue_dO.arrive_and_expect_tx((B_H)*D_V*sizeof(bf16));
         plan.bar_prologue_dO.wait(0);
 
         // Delta computation: delta[i] = sum_j(O[i,j] * dO[i,j])
