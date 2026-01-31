@@ -15,6 +15,7 @@
 #include "sm100/helpers.h"
 
 #include "config.h"
+#include "preprocess_delta.cuh"
 
 namespace sm100::bwd::head128 {
 
@@ -42,10 +43,9 @@ WG1: P = QK^T Computation
      - Instruction: utcmma_ss
      - Accumulation mode
 
-WG2: Delta Computation
-  1. Read O from global memory
-  2. Read dO from SMEM
-  3. Compute delta = sum(O * dO, dim=-1)
+WG2: Delta Loading
+  1. Load precomputed delta from global memory to SMEM
+  2. Delta is computed by preprocess kernel before main kernel launch
 */
  
 /**
@@ -60,7 +60,7 @@ WG2: Delta Computation
  * - Block: 384 threads = 3 warpgroups (128 threads each)
  *   - Warpgroup 0: Data loading (TMA)
  *   - Warpgroup 1: QK^T computation (MMA)
- *   - Warpgroup 2: Delta computation
+ *   - Warpgroup 2: Delta loading (from precomputed delta)
  * 
  * 2CTA Cooperation:
  * - CTA0 processes Q[0:B_H/2, :] and KV[0:B_TOPK/2, :]
@@ -274,9 +274,10 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
         }
 
     // ========================================
-    // Warpgroup 2: Delta Computation (WG2) - 2CTA mode
-    // Compute: delta = sum(O * dO, dim=-1)
-    // Each CTA computes delta for B_H/2=64 rows
+    // Warpgroup 2: Delta Loading (WG2) - 2CTA mode
+    // Load precomputed delta from global memory to shared memory
+    // Delta is computed by preprocess kernel before main kernel launch
+    // Each CTA loads delta for B_H/2=64 rows
     // ========================================
     } else if (warpgroup_idx == 2) {
         if (cta_idx == 0 && warp_idx == 8 && elect_one_sync()) {
@@ -286,51 +287,22 @@ KernelTemplate<D_QK>::sparse_attn_bwd_kernel_devfunc(const SparseAttnBwdParams &
         }
         __syncthreads();
 
-        // Delta computation: delta[i] = sum_j(O[i,j] * dO[i,j])
+        // Load precomputed delta from global memory to shared memory
         // 2CTA mode: each thread processes one row, each CTA processes B_H/2=64 rows
         const int local_row_idx = idx_in_warpgroup;
         if (local_row_idx < B_H/2) {
             // Compute global row index (considering cta_idx offset)
             const int global_row_idx = cta_idx * (B_H/2) + local_row_idx;
             
-            // Read O from global memory (forward output)
-            const bf16* gO = params.o + s_q_idx * params.stride_o_s_q + global_row_idx * params.stride_o_h_q;
-            
-            // Use sdO defined at function start (do not redefine)
-            float delta = 0.0f;
-            
-            // Accumulate O * dO using vectorized loads
-            CUTE_UNROLL
-            for (int col = 0; col < D_V; col += 8) {
-                // Vectorized load of O (8 bf16 values = 128 bits)
-                uint4 o_raw = __ldg((const uint4*)(gO + col));
-                bf16x8 o_vec;
-                *(uint4*)&o_vec = o_raw;
-                
-                // Read dO from shared memory (using local_row_idx)
-                bf16x8 do_vec;
-                *(uint4*)&do_vec = *(uint4*)(&sdO(local_row_idx, col));
-                
-                // Accumulate dot product
-                delta += __bfloat162float(o_vec.a01.x) * __bfloat162float(do_vec.a01.x);
-                delta += __bfloat162float(o_vec.a01.y) * __bfloat162float(do_vec.a01.y);
-                delta += __bfloat162float(o_vec.a23.x) * __bfloat162float(do_vec.a23.x);
-                delta += __bfloat162float(o_vec.a23.y) * __bfloat162float(do_vec.a23.y);
-                delta += __bfloat162float(o_vec.a45.x) * __bfloat162float(do_vec.a45.x);
-                delta += __bfloat162float(o_vec.a45.y) * __bfloat162float(do_vec.a45.y);
-                delta += __bfloat162float(o_vec.a67.x) * __bfloat162float(do_vec.a67.x);
-                delta += __bfloat162float(o_vec.a67.y) * __bfloat162float(do_vec.a67.y);
-            }
-
-            // Write delta to global memory
-            float* gDelta = params.delta + s_q_idx * params.stride_delta_s_q + global_row_idx * params.stride_delta_h_q;
-            *gDelta = delta;
+            // Read precomputed delta from global memory
+            const float* gDelta = params.delta + s_q_idx * params.stride_delta_s_q + global_row_idx * params.stride_delta_h_q;
+            float delta = __ldg(gDelta);
             
             // Write delta to shared memory buffer (using local_row_idx)
             plan.rowwise_delta_buf[local_row_idx] = delta;
         }
         
-        // Sync to ensure all delta computations are done
+        // Sync to ensure all delta loads are done
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg2_sync);
     }
  
@@ -381,6 +353,10 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     KU_ASSERT(params.h_q == Kernel::B_H);           // Query head count must equal B_H
     KU_ASSERT(params.d_qk == D_QK);
 
+    // === Launch preprocessing kernel to compute delta ===
+    // Delta must be computed before main kernel launch
+    run_bwd_preprocess_delta_kernel<D_QK>(params);
+
     // === Create TMA descriptor for Q (2SM mode) ===
     // Q shape: [h_q, d_qk, s_q] = [h_q, 576, s_q] (including NoPE 512 + RoPE 64)
     auto shape_Q = make_shape(params.h_q, Kernel::D_Q, params.s_q);
@@ -411,8 +387,9 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
         (typename Kernel::SmemLayoutdO){}
     );
 
-    // === Create TMA descriptor for O (to read forward output for Delta computation) ===
+    // === Create TMA descriptor for O (kept for compatibility, not used in main kernel) ===
     // O shape: [h_q, d_v, s_q]
+    // Note: O is no longer used in main kernel since delta is precomputed
     auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
     auto tma_O = cute::make_tma_copy(
         SM100_TMA_2SM_LOAD_NOSPLIT{},  // 2SM TMA for cluster
@@ -459,7 +436,7 @@ void run_bwd_phase1_kernel(const SparseAttnBwdParams& params) {
     > tma_params = {
         shape_Q, tma_Q,
         shape_dO, tma_dO,
-        shape_O, tma_O,
+        shape_O, tma_O,  // Kept for compatibility, not used in main kernel
         tensor_map_kv
     };
     
