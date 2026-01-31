@@ -16,12 +16,12 @@ using namespace cute;
 template<
     typename Shape_Q, typename TMA_Q,
     typename Shape_dO, typename TMA_dO,
-    typename Shape_O, typename TMA_O
+    typename Shape_dQ, typename TMA_dQ
 >
 struct TmaParams {
     Shape_Q shape_Q; TMA_Q tma_Q;
     Shape_dO shape_dO; TMA_dO tma_dO;
-    Shape_O shape_O; TMA_O tma_O;
+    Shape_dQ shape_dQ; TMA_dQ tma_dQ;
     CUtensorMap tensor_map_kv;
 };
 
@@ -165,6 +165,38 @@ using TiledMMA_P = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
+// TiledMMA_dP: 用于计算 dP = dO @ V^T
+// 2CTA 模式: [B_H, B_TOPK] = [128, 64]
+// dO: [B_H/2, D_V] = [64, 512], V: [B_TOPK/2, D_V] = [32, 512]
+// 指令: utcmma_ss (SMEM-SMEM), 2x1SM 协作
+using TiledMMA_dP = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+// TiledMMA_dKV_part1: 用于计算 dKV 第一部分 = s^T @ dO
+// 2CTA 模式: s: [B_H/2, B_TOPK] = [64, 64], dO: [B_H/2, D_V] = [64, 512]
+// 输出: dKV: [B_TOPK/2, D_V] = [32, 512]
+// 指令: utcmma_ss (SMEM-SMEM), 2x1SM 协作
+using TiledMMA_dKV_part1 = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_TOPK, D_V, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+// TiledMMA_dQ: 用于计算 dQ = ds @ KV^T (累加模式)
+// 2CTA 模式: ds: [B_H/2, B_TOPK] = [64, 64], KV: [B_TOPK/2, D_Q] = [32, 576]
+// 输出: dQ: [B_H/2, D_Q] = [64, 576]
+// 指令: utcmma_ss (SMEM-SMEM), 2x1SM 协作
+using TiledMMA_dQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, D_Q, UMMA::Major::K, UMMA::Major::K>{}
+));
+
+// TiledMMA_dKV_part2: 用于计算 dKV 第二部分 = ds^T @ Q (累加模式)
+// 2CTA 模式: ds: [B_H/2, B_TOPK] = [64, 64], Q: [B_H/2, D_Q] = [64, 576]
+// 输出: dKV: [B_TOPK/2, D_Q] = [32, 576]
+// 指令: utcmma_ss (SMEM-SMEM), 2x1SM 协作
+using TiledMMA_dKV_part2 = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_TOPK, D_Q, UMMA::Major::K, UMMA::Major::K>{}
+));
+
 // ============================================================================
 // Named Barriers 枚举
 // ============================================================================
@@ -242,7 +274,10 @@ struct SharedMemoryPlan {
     array_aligned<bf16, cosize_v<SmemLayoutdO>> dO;                     // [B_H/2, D_V] bf16
     
     // S/dS 矩阵: [B_H/2, B_TOPK]
-    array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    struct {
+        array_aligned<bf16, cosize_v<SmemLayoutS>> s;   // Softmax后的P
+        array_aligned<bf16, cosize_v<SmemLayoutS>> ds;  // dS梯度
+    } s_ds;
     
     // P 交换缓冲区 (用于 warp 间数据交换, 2CTA 模式)
     float p[(B_H/2)*B_TOPK];
@@ -278,6 +313,14 @@ struct SharedMemoryPlan {
     // KV 有效性屏障 (单缓冲模式)
     transac_bar_t bar_kv_valid_ready[NUM_BUFS];
     transac_bar_t bar_kv_valid_free[NUM_BUFS];
+    
+    // WG0-WG2 同步屏障 (单缓冲模式)
+    transac_bar_t bar_p_ready[NUM_BUFS];        // WG2通知WG0 p已准备好
+    transac_bar_t bar_dp_ready[NUM_BUFS];       // WG2通知WG0 dp已准备好
+    transac_bar_t bar_s_ready[NUM_BUFS];        // WG0通知WG2 s已准备好
+    transac_bar_t bar_ds_ready[NUM_BUFS];       // WG0通知WG2 ds已准备好
+    transac_bar_t bar_dq_ready[NUM_BUFS];       // WG2通知WG1 dQ已准备好
+    transac_bar_t bar_dkv_ready[NUM_BUFS];      // WG2通知WG1 dKV已准备好
     
     // TMEM 起始地址
     array_aligned<uint32_t, 1> tmem_start_addr;

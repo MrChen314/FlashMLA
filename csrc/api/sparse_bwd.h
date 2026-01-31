@@ -48,7 +48,7 @@ protected:
  * @param sm_scale Softmax缩放因子
  * @param d_v Value维度 (512)
  * @param topk_length 可选的TopK长度 [s_q], int32
- * @return std::vector<at::Tensor> {dQ, dKV, delta}
+ * @return std::vector<at::Tensor> {dQ, dKV}
  */
 static std::vector<at::Tensor> sparse_attn_bwd_interface(
     const at::Tensor &q,
@@ -119,13 +119,17 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(lse);
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
 
-    // 分配输出张量
+    // 分配输出张量和中间张量
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
 
+    // 输出张量
     at::Tensor dQ = torch::empty({s_q, h_q, d_qk}, opts);
     at::Tensor dKV = torch::zeros({s_kv, h_kv, d_qk}, opts.dtype(torch::kFloat32));  // float32累加
+    
+    // 中间张量：delta 由 preprocess_delta.cuh 预计算，供主 kernel 使用（不作为返回值）
     at::Tensor delta = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat32));  // Delta = sum(O * dO, dim=-1)
+    
     KU_CHECK_CONTIGUOUS(dQ);
     KU_CHECK_CONTIGUOUS(dKV);
     KU_CHECK_CONTIGUOUS(delta);
@@ -193,5 +197,5 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     // 将 dKV 从 float32 转换为 bfloat16
     at::Tensor dKV_bf16 = dKV.to(torch::kBFloat16);
 
-    return {dQ, dKV_bf16, delta};
+    return {dQ, dKV_bf16};
 }
