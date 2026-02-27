@@ -4,7 +4,7 @@
 
 #include "params.h"
 
-#include "sm90/prefill/sparse/phase1.h"
+// #include "sm90/prefill/sparse/phase1.h"
 #include "sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
@@ -26,26 +26,26 @@ class FwdImplBase : public ImplBase<
     FwdFeatures
 > {};
 
-class Fwd_Sm90_Impl : public FwdImplBase {
-    DECLARE_SUPPORTED_FEATURES(
-        FwdFeatures::HEAD_64,
-        FwdFeatures::HEAD_128,
-        FwdFeatures::HEAD_DIM_512,
-        FwdFeatures::HEAD_DIM_576,
-        FwdFeatures::ATTN_SINK,
-        FwdFeatures::SINK_LSE,
-        FwdFeatures::TOPK_LENGTH
-    )
+// class Fwd_Sm90_Impl : public FwdImplBase {
+//     DECLARE_SUPPORTED_FEATURES(
+//         FwdFeatures::HEAD_64,
+//         FwdFeatures::HEAD_128,
+//         FwdFeatures::HEAD_DIM_512,
+//         FwdFeatures::HEAD_DIM_576,
+//         FwdFeatures::ATTN_SINK,
+//         FwdFeatures::SINK_LSE,
+//         FwdFeatures::TOPK_LENGTH
+//     )
 
-protected:
-    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
-                sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
-            });
-        });
-    }
-};
+// protected:
+//     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+//         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+//             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
+//                 sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+//             });
+//         });
+//     }
+// };
 
 class Fwd_Sm100_Head64_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -221,8 +221,9 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     }
 
     if (is_sm90a) {
-        Fwd_Sm90_Impl fwd_impl;
-        fwd_impl.run(params, required_features);
+        // Fwd_Sm90_Impl fwd_impl;
+        // fwd_impl.run(params, required_features);
+        TORCH_CHECK(false, "SM90 is disabled in this build");
     } else if (is_sm100f) {
         if (h_q == 64) {
             Fwd_Sm100_Head64_Impl fwd_impl;

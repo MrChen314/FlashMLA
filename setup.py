@@ -41,12 +41,12 @@ def get_arch_flags():
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100f,code=sm_100f"])
-    if not DISABLE_SM90:
-        arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+    # if not DISABLE_SM90:
+    #     arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
     return arch_flags
 
 def get_nvcc_thread_args():
-    nvcc_threads = os.getenv("NVCC_THREADS") or "32"
+    nvcc_threads = os.getenv("NVCC_THREADS") or "192"
     return ["--threads", nvcc_threads]
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
@@ -66,30 +66,30 @@ ext_modules.append(
             # API
             "csrc/api/api.cpp",
 
-            # Misc kernels for decoding
-            "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-            "csrc/smxx/decode/combine/combine.cu",
+            # # Misc kernels for decoding
+            # "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+            # "csrc/smxx/decode/combine/combine.cu",
 
-            # sm90 dense decode
-            "csrc/sm90/decode/dense/instantiations/fp16.cu",
-            "csrc/sm90/decode/dense/instantiations/bf16.cu",
+            # # sm90 dense decode
+            # "csrc/sm90/decode/dense/instantiations/fp16.cu",
+            # "csrc/sm90/decode/dense/instantiations/bf16.cu",
 
-            # sm90 sparse decode
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+            # # sm90 sparse decode
+            # "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
+            # "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
+            # "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
+            # "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
 
-            # sm90 sparse prefill
-            "csrc/sm90/prefill/sparse/fwd.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+            # # sm90 sparse prefill
+            # "csrc/sm90/prefill/sparse/fwd.cu",
+            # "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+            # "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
+            # "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+            # "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 
-            # sm100 dense prefill & backward
-            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+            # # sm100 dense prefill & backward
+            # "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+            # "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
 
             # sm100 sparse prefill forward
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
@@ -101,10 +101,10 @@ ext_modules.append(
             # sm100 sparse prefill backward
             "csrc/sm100/prefill/sparse/bwd/head128/instantiations/phase1_k576.cu",
 
-            # sm100 sparse decode
-            "csrc/sm100/decode/head64/instantiations/v32.cu",
-            "csrc/sm100/decode/head64/instantiations/model1.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+            # # sm100 sparse decode
+            # "csrc/sm100/decode/head64/instantiations/v32.cu",
+            # "csrc/sm100/decode/head64/instantiations/model1.cu",
+            # "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
