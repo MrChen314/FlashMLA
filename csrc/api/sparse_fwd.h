@@ -104,6 +104,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &indices,
     float sm_scale,
     int d_v,
+    int q_start_index_s,
+    bool write_p_out,
     const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length
 ) {
@@ -130,6 +132,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
 
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    TORCH_CHECK(q_start_index_s >= 0, "q_start_index_s must be >= 0");
     
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -162,12 +165,18 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
     at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
     at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    at::Tensor p_out;
+    if (write_p_out) {
+        p_out = torch::empty({s_q, h_q, topk}, opts.dtype(torch::kFloat));
+    }
     KU_CHECK_CONTIGUOUS(out);
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
+    if (write_p_out) KU_CHECK_CONTIGUOUS(p_out);
 
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        q_start_index_s,
         sm_scale, sm_scale * LOG_2_E,
 
         (bf16*)q.data_ptr(),
@@ -183,6 +192,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         (bf16*)out.data_ptr(),
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
+        write_p_out ? (float*)p_out.data_ptr() : nullptr,
 
         arch.num_sms,
         at::cuda::getCurrentCUDAStream().stream()
@@ -239,5 +249,5 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         TORCH_CHECK(false, "Unsupported architecture");
     }
 
-    return {out, max_logits, lse};
+    return {out, max_logits, lse, p_out};
 }

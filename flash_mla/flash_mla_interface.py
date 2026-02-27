@@ -188,7 +188,9 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_start_index_s: int = 0,
+    write_p_out: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Sparse attention prefill kernel
 
@@ -204,16 +206,55 @@ def flash_mla_sparse_fwd(
             This argument has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
+        q_start_index_s: The starting position of the current chunk in the global sequence (used for causal masking)
+        write_p_out: bool. Whether to write p_out to global memory.
 
     Returns:
-        (output, max_logits, lse)
+        (output, max_logits, lse, p_out)
         Please refer to tests/ref.py for the precise definitions of these parameters.
         - output: [s_q, h_q, d_v], bfloat16
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, log-sum-exp of attention scores
+        - p_out: [s_q, h_q, topk], float32 probability (None when write_p_out=False)
     """
     results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        q, kv, indices, sm_scale, d_v, q_start_index_s, write_p_out, attn_sink, topk_length
+    )
+    return results
+
+
+def flash_mla_sparse_bwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    o: torch.Tensor,
+    dO: torch.Tensor,
+    indices: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention backward kernel
+
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16 - Query tensor
+        kv: [s_kv, h_kv, d_qk], bfloat16 - Key/Value tensor
+        o: [s_q, h_q, d_v], bfloat16 - Forward output
+        dO: [s_q, h_q, d_v], bfloat16 - Output gradient
+        indices: [s_q, h_kv, topk], int32 - TopK indices
+        lse: [s_q, h_q], float32 - Log-Sum-Exp (from forward)
+        sm_scale: float - Softmax scaling factor
+        d_v: int - Value dimension, must be 512
+        topk_length: optional, [s_q], int32 - Optional TopK length
+
+    Returns:
+        (dQ, dKV)
+        - dQ: [s_q, h_q, d_qk], bfloat16 - Query gradient
+        - dKV: [s_kv, h_kv, d_qk], bfloat16 - KV gradient
+    """
+    results = flash_mla_cuda.sparse_prefill_bwd(
+        q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length
     )
     return results
 

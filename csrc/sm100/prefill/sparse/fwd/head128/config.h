@@ -13,11 +13,13 @@ using namespace cute;
 
 template<
     typename Shape_Q, typename TMA_Q,
-    typename Shape_O, typename TMA_O
+    typename Shape_O, typename TMA_O,
+    typename Shape_P = void*, typename TMA_P = void*
 >
 struct TmaParams {
     Shape_Q shape_Q; TMA_Q tma_Q;
     Shape_O shape_O; TMA_O tma_O;
+    Shape_P shape_P; TMA_P tma_P;
     CUtensorMap tensor_map_kv;
 };
 
@@ -89,6 +91,8 @@ using SmemLayoutSTiles = decltype(coalesce(tile_to_shape(
 	Shape<Int<B_H/2>, Int<64*NUM_TILES>>{},
 	Step<_1, _2>{}
 ), Shape<_1, _1>{}));
+
+using SmemLayoutP = Layout<Shape<Int<B_H/2>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>;
 
 struct SharedMemoryPlan {
     union {
