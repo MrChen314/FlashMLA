@@ -40,7 +40,7 @@ static constexpr int D_V = 512;
 static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int B_H = 128;
 static constexpr int B_TOPK = 64;
-static constexpr int NUM_THREADS = 4 * 128;  // 4 warp-groups
+static constexpr int NUM_THREADS = 16 * 32;  // 16 warps
 
 template<int NUM_TILES>
 using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
