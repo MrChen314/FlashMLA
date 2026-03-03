@@ -48,6 +48,7 @@ protected:
  * @param sm_scale Softmax scaling factor
  * @param d_v Value dimension (512)
  * @param topk_length Optional TopK length [s_q], int32
+ * @param q_start_index_s The starting position of the current chunk in the global sequence (used for causal masking)
  * @return std::vector<at::Tensor> {dQ, dKV}
  */
 static std::vector<at::Tensor> sparse_attn_bwd_interface(
@@ -59,7 +60,8 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
     const at::Tensor &lse,
     float sm_scale,
     int d_v,
-    const std::optional<at::Tensor> &topk_length
+    const std::optional<at::Tensor> &topk_length,
+    int q_start_index_s
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -86,6 +88,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
 
     TORCH_CHECK(d_qk == 576, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v: ", d_v);
+    TORCH_CHECK(q_start_index_s >= 0, "q_start_index_s must be >= 0");
     TORCH_CHECK(h_kv == 1, "Sparse attention backward currently only supports h_kv=1. Got h_kv=", h_kv);
     TORCH_CHECK(topk > 0 && topk % 64 == 0, "Sparse attention backward requires topk to be a positive multiple of 64. Got topk=", topk);
 
@@ -138,6 +141,7 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
 
     SparseAttnBwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        q_start_index_s,
         sm_scale, sm_scale * LOG_2_E,
 
         // Input tensors

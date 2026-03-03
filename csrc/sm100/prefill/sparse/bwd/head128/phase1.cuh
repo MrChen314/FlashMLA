@@ -70,7 +70,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     
     const int cta_idx = blockIdx.x % 2;  // 0 or 1
     const int s_q_idx = blockIdx.x / 2;
-    const int max_kv_i = s_q_idx;
+    const int max_kv_i = params.q_start_index_s + s_q_idx;
     const int tid = threadIdx.x;
     const int warp_idx = cutlass::canonical_warp_idx_sync();  // Global warp index
     const int lane_idx = threadIdx.x % 32;

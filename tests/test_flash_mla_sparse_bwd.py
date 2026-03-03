@@ -11,7 +11,7 @@ def calc_diff(a: torch.Tensor, b: torch.Tensor):
     return max_diff, rel_diff
 
 
-def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
+def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True, q_start_index_s=0):
     q = q.float()
     kv = kv.float()
     indices = indices.transpose(1, 2)
@@ -26,7 +26,7 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
     b, _, _, dim_v = v.shape
     g_index = g
     h_index = h // g
-    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
+    compressed_casual_mask = torch.arange(q_start_index_s, q_start_index_s + sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
         1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
     ).view(1, -1)
 
@@ -48,17 +48,29 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
     return o.to(torch.bfloat16)
 
 
-def ref_sparse_mla_bwd_interface(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True):
+def ref_sparse_mla_bwd_interface(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, q_start_index_s=0):
     q = q.detach().clone()
     kv = kv.detach().clone()
     q.requires_grad = True
     kv.requires_grad = True
-    o = ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale, is_casual)
+    o = ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale, is_casual, q_start_index_s)
     o.backward(do)
     return q.grad, kv.grad
 
 
-def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True):
+def test_sparse_mla_bwd(
+    B=1,
+    S=4096,
+    SKV=8192,
+    H=64,
+    HKV=1,
+    DQKV=576,
+    DV=512,
+    topk=2048,
+    dtype=torch.bfloat16,
+    check_correctness=True,
+    q_start_index_s=0,
+):
     # Prepare data
     q = torch.randn((B, S, H, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
     kv = torch.randn((B, SKV, HKV, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
@@ -68,12 +80,13 @@ def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, to
     for b in range(B):
         for t in range(S):
             for h in range(HKV):
-                i_i = torch.randperm(max(1, t))[:topk]
+                max_kv_i = min(SKV, max(1, q_start_index_s + t))
+                i_i = torch.randperm(max_kv_i)[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
 
     flash_out, _, flash_lse, _ = flash_mla.flash_mla_sparse_fwd(
         q.squeeze(0).contiguous(), kv.squeeze(0).contiguous(), indices.squeeze(0).contiguous(),
-        sm_scale=576 ** -0.5
+        sm_scale=576 ** -0.5, q_start_index_s=q_start_index_s
     )
 
     # flash_mla backward
@@ -85,12 +98,15 @@ def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, to
     flash_dq, flash_dkv = flash_mla.flash_mla_sparse_bwd(
         q_3d, kv_3d, flash_out, do_3d, indices_3d, flash_lse,
         sm_scale=sm_scale,
+        q_start_index_s=q_start_index_s,
     )
     torch.cuda.synchronize()
 
     if check_correctness:
         # Precision comparison: ref vs flash
-        ref_dq, ref_dkv = ref_sparse_mla_bwd_interface(q, kv, None, do, indices, None)
+        ref_dq, ref_dkv = ref_sparse_mla_bwd_interface(
+            q, kv, None, do, indices, None, q_start_index_s=q_start_index_s
+        )
         ref_dq_3d = ref_dq.squeeze(0)
         ref_dkv_3d = ref_dkv.squeeze(0)
         flash_dq_max_diff, flash_dq_rel_diff = calc_diff(flash_dq, ref_dq_3d)
@@ -111,6 +127,7 @@ def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, to
         return flash_mla.flash_mla_sparse_bwd(
                     q_3d, kv_3d, flash_out, do_3d, indices_3d, flash_lse,
                     sm_scale=sm_scale,
+                    q_start_index_s=q_start_index_s,
                 )
 
     bench_result = kk.bench_kineto(fn, num_tests=100)
@@ -137,4 +154,16 @@ def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, to
 
 
 if __name__ == "__main__":
-    test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=128, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True)
+    test_sparse_mla_bwd(
+        B=1,
+        S=4096,
+        SKV=8192,
+        H=128,
+        HKV=1,
+        DQKV=576,
+        DV=512,
+        topk=2048,
+        dtype=torch.bfloat16,
+        check_correctness=True,
+        q_start_index_s=2048,
+    )

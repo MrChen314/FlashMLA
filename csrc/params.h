@@ -172,6 +172,7 @@ struct SparseAttnFwdParams {
 // Sparse attention backward parameter struct
 struct SparseAttnBwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    int q_start_index_s;
     float sm_scale, sm_scale_div_log2;
 
     // Input tensors

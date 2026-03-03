@@ -233,6 +233,7 @@ def flash_mla_sparse_bwd(
     sm_scale: float,
     d_v: int = 512,
     topk_length: Optional[torch.Tensor] = None,
+    q_start_index_s: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sparse attention backward kernel
@@ -247,6 +248,7 @@ def flash_mla_sparse_bwd(
         sm_scale: float - Softmax scaling factor
         d_v: int - Value dimension, must be 512
         topk_length: optional, [s_q], int32 - Optional TopK length
+        q_start_index_s: The starting position of the current chunk in the global sequence (used for causal masking)
 
     Returns:
         (dQ, dKV)
@@ -254,7 +256,7 @@ def flash_mla_sparse_bwd(
         - dKV: [s_kv, h_kv, d_qk], bfloat16 - KV gradient
     """
     results = flash_mla_cuda.sparse_prefill_bwd(
-        q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length
+        q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length, q_start_index_s
     )
     return results
 
