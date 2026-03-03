@@ -71,6 +71,7 @@ static constexpr int kNumDkvTransferWarps = 8;
 static constexpr int kNumMmaWarps = 1;
 static constexpr int kNumKvValidLoadWarps = 1;
 static constexpr int kNumEmptyWarps = 1;
+static constexpr int kThreadsPerWarp = 32;
 
 static constexpr int kSoftmaxAndDQTransferFirstWarp = 0;
 static constexpr int kKvTileTransferFirstWarp = kSoftmaxAndDQTransferFirstWarp + kNumSoftmaxAndDQTransferWarps;
@@ -86,7 +87,7 @@ static constexpr unsigned long long kWarpAssignment = 0x0543'3333'3332'1111ull;
 
 static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps");
 static_assert(kEmptyFirstWarp + kNumEmptyWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
-static_assert(NUM_THREADS == kNumAssignedWarps * NumThreadsPerWarp, "NUM_THREADS must match warp assignment");
+static_assert(NUM_THREADS == kNumAssignedWarps * kThreadsPerWarp, "NUM_THREADS must match warp assignment");
 
 CUTE_DEVICE
 WarpRole warp_idx_to_role(int warp_idx) {
@@ -139,21 +140,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         plan.bar_prologue_dO.init(1);
         plan.bar_p_ready.init(1);        // MMA warp notifies softmax warps that p is ready (2CTA sync)
         plan.bar_dp_ready.init(1);       // MMA warp notifies softmax warps that dp is ready (2CTA sync)
-        plan.bar_s_ready.init(kNumSoftmaxAndDQTransferWarps * NumThreadsPerWarp);
-        plan.bar_ds_ready.init(kNumSoftmaxAndDQTransferWarps * NumThreadsPerWarp);
+        plan.bar_s_ready.init(kNumSoftmaxAndDQTransferWarps * kThreadsPerWarp);
+        plan.bar_ds_ready.init(kNumSoftmaxAndDQTransferWarps * kThreadsPerWarp);
         // MMA<->dKV transfer barriers
         plan.bar_dkv_part0_ready.init(1);
         plan.bar_dkv_part1_ready.init(1);
         plan.bar_dkv_part2_ready.init(1);
-        plan.bar_dkv_part0_done.init(kNumDkvTransferWarps * NumThreadsPerWarp);
-        plan.bar_dkv_part1_done.init(kNumDkvTransferWarps * NumThreadsPerWarp);
-        plan.bar_dkv_part2_done.init(kNumDkvTransferWarps * NumThreadsPerWarp);
+        plan.bar_dkv_part0_done.init(kNumDkvTransferWarps * kThreadsPerWarp);
+        plan.bar_dkv_part1_done.init(kNumDkvTransferWarps * kThreadsPerWarp);
+        plan.bar_dkv_part2_done.init(kNumDkvTransferWarps * kThreadsPerWarp);
         // KV-tile warp <-> MMA warp barriers for kv_peer cp_async
         plan.bar_kv_peer_cp_async.init(1);      // cp_async transaction barrier
         plan.bar_kv_peer_ready.init(1);         // KV tile warp notifies MMA warp kv_peer is ready
         // MMA->softmax barrier for dQ computation
         plan.bar_k_valid_ready.init(8);
-        plan.bar_k_valid_free.init(kNumSoftmaxAndDQTransferWarps * NumThreadsPerWarp);
+        plan.bar_k_valid_free.init(kNumSoftmaxAndDQTransferWarps * kThreadsPerWarp);
         plan.bar_dq_ready.init(1);              // MMA warp notifies softmax warps that dQ is ready
         fence_barrier_init();
     }
@@ -211,7 +212,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Responsibility: Compute softmax(P), load delta, compute ds
     // ========================================
     if (warp_role == WarpRole::SoftmaxAndDQTransfer) {
-        const int idx_in_softmax = (warp_idx - kSoftmaxAndDQTransferFirstWarp) * NumThreadsPerWarp + lane_idx;
+        const int idx_in_softmax = (warp_idx - kSoftmaxAndDQTransferFirstWarp) * kThreadsPerWarp + lane_idx;
         const int global_row_idx = cta_idx * (B_H/2) + idx_in_softmax % (B_H/2);
         // Forward stores LSE in natural-log domain. Convert to log2 domain because
         // backward reconstructs softmax with exp2(P*scale_log2e - lse_log2).
@@ -492,10 +493,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Responsibility: Read dKV from TMEM and atomicAdd to global memory
     // ========================================
     if (warp_role == WarpRole::DkvTransfer) {
-        const int idx_in_dkv_transfer = (warp_idx - kDkvTransferFirstWarp) * NumThreadsPerWarp + lane_idx;
-        const int row = idx_in_dkv_transfer % B_TOPK;                        // 0-63: KV row
-        const int half = (idx_in_dkv_transfer / B_TOPK) & 1;                 // 0 or 1: column half
-        const int chunk_group = idx_in_dkv_transfer / (B_TOPK * 2);          // split 4 chunks across 2 groups
+        // TMEM ld mapping is tied to physical 4-warp warpgroup lanes, so row/half must
+        // be derived from warp_idx%4 instead of role-local warp ordering.
+        const int tmem_lane_128 = (warp_idx & 0x3) * kThreadsPerWarp + lane_idx;  // 0..127 within physical warpgroup
+        const int row = tmem_lane_128 % B_TOPK;                                     // 0-63: KV row
+        const int half = (tmem_lane_128 / B_TOPK) & 1;                              // 0 or 1: column half
+        const int chunk_group = (warp_idx - kDkvTransferFirstWarp) / 4;             // split 4 chunks across 2 groups
         static_assert(kNumDkvTransferWarps == 8);
         static_assert(B_TOPK == 64);
 
