@@ -21,11 +21,6 @@ namespace sm100::bwd::head128 {
 using namespace cute;
 
 CUTE_DEVICE
-float2 float2_sub(const float2& a, const float2& b) {
-    return ku::float2_add(a, ku::float2_neg(b));
-}
-
-CUTE_DEVICE
 void atomic_add_32floats_unrolled(float* dst, const float* src) {
     asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
         :: "l"(dst + 0), "f"(src[0]), "f"(src[1]), "f"(src[2]), "f"(src[3]) : "memory");
@@ -209,7 +204,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
     // ========================================
     // Softmax/dS role: Softmax and dS computation plus final dQ transfer.
-    // Responsibility: Compute softmax(P), load delta, compute ds
+    // Responsibility: Compute softmax(P), load negated delta, compute ds
     // ========================================
     if (warp_role == WarpRole::SoftmaxAndDQTransfer) {
         const int idx_in_softmax = (warp_idx - kSoftmaxAndDQTransferFirstWarp) * kThreadsPerWarp + lane_idx;
@@ -217,14 +212,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         // Forward stores LSE in natural-log domain. Convert to log2 domain because
         // backward reconstructs softmax with exp2(P*scale_log2e - lse_log2).
         const float row_lse = __ldg(lse_s + global_row_idx) * 1.44269504f;
-        const float delta_val = __ldg(delta_s + global_row_idx);
+        const float neg_delta_val = __ldg(delta_s + global_row_idx);
 
         const float sm_scale = 1.0f / sqrtf(float(D_QK));
         const float scale = sm_scale * 1.44269504f;
 
         const float2 neg_lse_f2 = make_float2(-row_lse, -row_lse);
         const float2 scale_f2 = make_float2(scale, scale);
-        const float2 delta_f2 = make_float2(delta_val, delta_val);
+        const float2 neg_delta_f2 = make_float2(neg_delta_val, neg_delta_val);
         const float2 sm_scale_f2 = make_float2(sm_scale, sm_scale);
 
         Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
@@ -301,8 +296,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 CUTE_UNROLL
                 for (int i = 0; i < DP_CHUNK_F2; ++i) {
                     const int idx = ch * DP_CHUNK_F2 + i;
-                    float2 dp_minus_delta = float2_sub(dp[i], delta_f2);
-                    float2 ds_val = ku::float2_mul(ku::float2_mul(p[idx], dp_minus_delta), sm_scale_f2);
+                    float2 dp_plus_neg_delta = ku::float2_add(dp[i], neg_delta_f2);
+                    float2 ds_val = ku::float2_mul(ku::float2_mul(p[idx], dp_plus_neg_delta), sm_scale_f2);
                     sDS(idx * 2 + col_offset, s_row) = bf16(ds_val.x);
                     sDS(idx * 2 + 1 + col_offset, s_row) = bf16(ds_val.y);
                 }
