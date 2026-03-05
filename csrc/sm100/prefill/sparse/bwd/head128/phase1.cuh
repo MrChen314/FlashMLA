@@ -236,6 +236,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         constexpr int SMEM_VEC_F2 = S_DS_VEC_ELEMS / 2;
         constexpr int NUM_SMEM_VEC_STORES = S_DS_COLS_PER_THREAD / S_DS_VEC_ELEMS;
         constexpr int SMEM_VEC_STRIDE = S_DS_ROWS_PER_CTA * S_DS_VEC_ELEMS;
+        static_assert(SMEM_VEC_F2 == 4, "Softmax vectorized write path expects 4 float2 per 128-bit store.");
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -265,17 +266,33 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             // Write S in 128-bit vectors to match K_INTER layout and reduce SMEM bank conflicts.
             CUTE_UNROLL
             for (int vec = 0; vec < NUM_SMEM_VEC_STORES; ++vec) {
-                __nv_bfloat162 s_pack[SMEM_VEC_F2];
-                CUTE_UNROLL
-                for (int i = 0; i < SMEM_VEC_F2; ++i) {
-                    const int idx = vec * SMEM_VEC_F2 + i;
-                    float2 scaled_p = ku::float2_fma(p[idx], scale_f2, neg_lse_f2);
-                    float2 p_val = make_float2(exp2f(scaled_p.x), exp2f(scaled_p.y));
-                    p[idx] = p_val;
-                    s_pack[i] = __float22bfloat162_rn(p_val);
+                const int base_idx = vec * SMEM_VEC_F2;
+                bf16x8 s_pack;
+                {
+                    float2 p_vec = ku::float2_fma(p[base_idx + 0], scale_f2, neg_lse_f2);
+                    p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
+                    p[base_idx + 0] = p_vec;
+                    s_pack.a01 = __float22bfloat162_rn(p_vec);
                 }
-                *reinterpret_cast<uint128_t*>(sS_base + vec * SMEM_VEC_STRIDE) =
-                    *reinterpret_cast<uint128_t*>(s_pack);
+                {
+                    float2 p_vec = ku::float2_fma(p[base_idx + 1], scale_f2, neg_lse_f2);
+                    p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
+                    p[base_idx + 1] = p_vec;
+                    s_pack.a23 = __float22bfloat162_rn(p_vec);
+                }
+                {
+                    float2 p_vec = ku::float2_fma(p[base_idx + 2], scale_f2, neg_lse_f2);
+                    p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
+                    p[base_idx + 2] = p_vec;
+                    s_pack.a45 = __float22bfloat162_rn(p_vec);
+                }
+                {
+                    float2 p_vec = ku::float2_fma(p[base_idx + 3], scale_f2, neg_lse_f2);
+                    p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
+                    p[base_idx + 3] = p_vec;
+                    s_pack.a67 = __float22bfloat162_rn(p_vec);
+                }
+                *reinterpret_cast<bf16x8*>(sS_base + vec * SMEM_VEC_STRIDE) = s_pack;
             }
             fence_view_async_shared();
             __threadfence_block();
@@ -301,16 +318,37 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
 
-                __nv_bfloat162 ds_pack[DP_CHUNK_F2];
-                CUTE_UNROLL
-                for (int i = 0; i < DP_CHUNK_F2; ++i) {
-                    const int idx = ch * DP_CHUNK_F2 + i;
-                    float2 dp_plus_neg_delta = ku::float2_add(dp[i], neg_delta_f2);
-                    float2 ds_val = ku::float2_mul(ku::float2_mul(p[idx], dp_plus_neg_delta), sm_scale_f2);
-                    ds_pack[i] = __float22bfloat162_rn(ds_val);
+                const int base_idx = ch * DP_CHUNK_F2;
+                bf16x8 ds_pack;
+                {
+                    float2 ds_vec = ku::float2_mul(
+                        ku::float2_mul(p[base_idx + 0], ku::float2_add(dp[0], neg_delta_f2)),
+                        sm_scale_f2
+                    );
+                    ds_pack.a01 = __float22bfloat162_rn(ds_vec);
                 }
-                *reinterpret_cast<uint128_t*>(sDS_base + ch * SMEM_VEC_STRIDE) =
-                    *reinterpret_cast<uint128_t*>(ds_pack);
+                {
+                    float2 ds_vec = ku::float2_mul(
+                        ku::float2_mul(p[base_idx + 1], ku::float2_add(dp[1], neg_delta_f2)),
+                        sm_scale_f2
+                    );
+                    ds_pack.a23 = __float22bfloat162_rn(ds_vec);
+                }
+                {
+                    float2 ds_vec = ku::float2_mul(
+                        ku::float2_mul(p[base_idx + 2], ku::float2_add(dp[2], neg_delta_f2)),
+                        sm_scale_f2
+                    );
+                    ds_pack.a45 = __float22bfloat162_rn(ds_vec);
+                }
+                {
+                    float2 ds_vec = ku::float2_mul(
+                        ku::float2_mul(p[base_idx + 3], ku::float2_add(dp[3], neg_delta_f2)),
+                        sm_scale_f2
+                    );
+                    ds_pack.a67 = __float22bfloat162_rn(ds_vec);
+                }
+                *reinterpret_cast<bf16x8*>(sDS_base + ch * SMEM_VEC_STRIDE) = ds_pack;
             }
             fence_view_async_shared();
             __threadfence_block();
