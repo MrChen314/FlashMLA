@@ -222,15 +222,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         const float2 neg_delta_f2 = make_float2(neg_delta_val, neg_delta_val);
         const float2 sm_scale_f2 = make_float2(sm_scale, sm_scale);
 
-        Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
-        Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutS{});
-
         const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
-        const uint32_t tmem_lane = idx_in_softmax % (B_H/2);
+        const uint32_t tmem_lane = idx_in_softmax % S_DS_ROWS_PER_CTA;
         const uint32_t tmem_p_addr = tmem_base + (tmem_lane << 16) + tmem_cols::P;
         const uint32_t tmem_dp_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
-        const int col_offset = (idx_in_softmax / 64) * 32;
-        const int s_row = idx_in_softmax % 64;
+        const int row_in_tile = idx_in_softmax % S_DS_ROWS_PER_CTA;
+        const int col_half = idx_in_softmax / S_DS_ROWS_PER_CTA;
+        bf16* sS_base = plan.s_ds.s.data() +
+            row_in_tile * S_DS_VEC_ELEMS + col_half * S_DS_ROWS_PER_CTA * S_DS_COLS_PER_THREAD;
+        bf16* sDS_base = plan.s_ds.ds.data() +
+            row_in_tile * S_DS_VEC_ELEMS + col_half * S_DS_ROWS_PER_CTA * S_DS_COLS_PER_THREAD;
+
+        constexpr int SMEM_VEC_F2 = S_DS_VEC_ELEMS / 2;
+        constexpr int NUM_SMEM_VEC_STORES = S_DS_COLS_PER_THREAD / S_DS_VEC_ELEMS;
+        constexpr int SMEM_VEC_STRIDE = S_DS_ROWS_PER_CTA * S_DS_VEC_ELEMS;
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -248,7 +253,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
             plan.bar_k_valid_ready.wait(phase);
             const uint32_t is_k_valid_lo =
-                *(uint32_t*)(plan.is_k_valid + (idx_in_softmax >= 64 ? B_TOPK/8/2 : 0));
+                *(uint32_t*)(plan.is_k_valid + (idx_in_softmax >= S_DS_ROWS_PER_CTA ? B_TOPK/8/2 : 0));
             float* p_float = (float*)p;
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
@@ -257,17 +262,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             }
             plan.bar_k_valid_free.arrive();
 
+            // Write S in 128-bit vectors to match K_INTER layout and reduce SMEM bank conflicts.
             CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                float2 scaled_p = ku::float2_fma(p[i], scale_f2, neg_lse_f2);
-                p[i].x = exp2f(scaled_p.x);
-                p[i].y = exp2f(scaled_p.y);
-            }
-
-            CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                sS(i * 2 + col_offset, s_row) = bf16(p[i].x);
-                sS(i * 2 + 1 + col_offset, s_row) = bf16(p[i].y);
+            for (int vec = 0; vec < NUM_SMEM_VEC_STORES; ++vec) {
+                __nv_bfloat162 s_pack[SMEM_VEC_F2];
+                CUTE_UNROLL
+                for (int i = 0; i < SMEM_VEC_F2; ++i) {
+                    const int idx = vec * SMEM_VEC_F2 + i;
+                    float2 scaled_p = ku::float2_fma(p[idx], scale_f2, neg_lse_f2);
+                    float2 p_val = make_float2(exp2f(scaled_p.x), exp2f(scaled_p.y));
+                    p[idx] = p_val;
+                    s_pack[i] = __float22bfloat162_rn(p_val);
+                }
+                *reinterpret_cast<uint128_t*>(sS_base + vec * SMEM_VEC_STRIDE) =
+                    *reinterpret_cast<uint128_t*>(s_pack);
             }
             fence_view_async_shared();
             __threadfence_block();
@@ -284,7 +292,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             ku::tcgen05_after_thread_sync();
 
             // Steps 8-10: Stream dP in small chunks and compute ds directly to SMEM.
-            constexpr int DP_CHUNK_F2 = 4;
+            constexpr int DP_CHUNK_F2 = SMEM_VEC_F2;
             constexpr int NUM_DP_CHUNKS = (B_TOPK/2)/2 / DP_CHUNK_F2;
             CUTE_UNROLL
             for (int ch = 0; ch < NUM_DP_CHUNKS; ++ch) {
@@ -293,14 +301,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
 
+                __nv_bfloat162 ds_pack[DP_CHUNK_F2];
                 CUTE_UNROLL
                 for (int i = 0; i < DP_CHUNK_F2; ++i) {
                     const int idx = ch * DP_CHUNK_F2 + i;
                     float2 dp_plus_neg_delta = ku::float2_add(dp[i], neg_delta_f2);
                     float2 ds_val = ku::float2_mul(ku::float2_mul(p[idx], dp_plus_neg_delta), sm_scale_f2);
-                    sDS(idx * 2 + col_offset, s_row) = bf16(ds_val.x);
-                    sDS(idx * 2 + 1 + col_offset, s_row) = bf16(ds_val.y);
+                    ds_pack[i] = __float22bfloat162_rn(ds_val);
                 }
+                *reinterpret_cast<uint128_t*>(sDS_base + ch * SMEM_VEC_STRIDE) =
+                    *reinterpret_cast<uint128_t*>(ds_pack);
             }
             fence_view_async_shared();
             __threadfence_block();

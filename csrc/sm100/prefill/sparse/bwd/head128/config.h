@@ -41,6 +41,11 @@ static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int B_H = 128;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_THREADS = 16 * 32;  // 16 warps
+static constexpr int S_DS_VEC_ELEMS = 8;      // one 128-bit store of bf16
+static constexpr int S_DS_ROWS_PER_CTA = B_H / 2;
+static constexpr int S_DS_COLS_PER_THREAD = B_TOPK / 2;
+static_assert(S_DS_ROWS_PER_CTA == B_TOPK, "S/dS writer mapping assumes a 64x64 softmax tile per CTA.");
+static_assert(S_DS_COLS_PER_THREAD % S_DS_VEC_ELEMS == 0, "S/dS vectorized stores require B_TOPK/2 to be a multiple of 8.");
 
 template<int NUM_TILES>
 using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
