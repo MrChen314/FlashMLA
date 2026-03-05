@@ -67,10 +67,13 @@ def test_sparse_mla_bwd(
     DQKV=576,
     DV=512,
     topk=2048,
+    sm_scale=None,
     dtype=torch.bfloat16,
     check_correctness=True,
     q_start_index_s=0,
 ):
+    sm_scale = DQKV ** -0.5 if sm_scale is None else sm_scale
+
     # Prepare data
     q = torch.randn((B, S, H, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
     kv = torch.randn((B, SKV, HKV, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
@@ -86,11 +89,10 @@ def test_sparse_mla_bwd(
 
     flash_out, _, flash_lse, _ = flash_mla.flash_mla_sparse_fwd(
         q.squeeze(0).contiguous(), kv.squeeze(0).contiguous(), indices.squeeze(0).contiguous(),
-        sm_scale=576 ** -0.5, q_start_index_s=q_start_index_s
+        sm_scale=sm_scale, q_start_index_s=q_start_index_s
     )
 
     # flash_mla backward
-    sm_scale = 1.0 / (DQKV ** 0.5)
     q_3d = q.squeeze(0)
     kv_3d = kv.squeeze(0)
     do_3d = do.squeeze(0)
@@ -105,7 +107,7 @@ def test_sparse_mla_bwd(
     if check_correctness:
         # Precision comparison: ref vs flash
         ref_dq, ref_dkv = ref_sparse_mla_bwd_interface(
-            q, kv, None, do, indices, None, q_start_index_s=q_start_index_s
+            q, kv, None, do, indices, None, sm_scale=sm_scale, q_start_index_s=q_start_index_s
         )
         ref_dq_3d = ref_dq.squeeze(0)
         ref_dkv_3d = ref_dkv.squeeze(0)
@@ -163,6 +165,7 @@ if __name__ == "__main__":
         DQKV=576,
         DV=512,
         topk=2048,
+        sm_scale=576 ** -0.5,
         dtype=torch.bfloat16,
         check_correctness=True,
         q_start_index_s=2048,

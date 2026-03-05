@@ -214,8 +214,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         const float row_lse = __ldg(lse_s + global_row_idx) * 1.44269504f;
         const float neg_delta_val = __ldg(delta_s + global_row_idx);
 
-        const float sm_scale = 1.0f / sqrtf(float(D_QK));
-        const float scale = sm_scale * 1.44269504f;
+        // Respect runtime softmax scale from API to match reference behavior.
+        const float sm_scale = params.sm_scale;
+        const float scale = params.sm_scale_div_log2;
 
         const float2 neg_lse_f2 = make_float2(-row_lse, -row_lse);
         const float2 scale_f2 = make_float2(scale, scale);
