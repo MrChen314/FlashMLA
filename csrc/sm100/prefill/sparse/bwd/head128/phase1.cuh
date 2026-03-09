@@ -257,7 +257,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 *(uint32_t*)(plan.is_k_valid + (idx_in_softmax >= S_DS_ROWS_PER_CTA ? B_TOPK/8/2 : 0));
             float* p_float = (float*)p;
             CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
+            for (int i = 0; i < B_TOPK/2; ++i) {
                 if (!(is_k_valid_lo >> i & 1))
                     p_float[i] = -CUDART_INF_F;
             }
@@ -554,7 +554,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             if (row_global < topk_length) {
                 kv_idx = __ldg(gIndices_s + row_global);
             }
-            const bool row_valid = kv_idx >= 0 && kv_idx < params.s_kv;
+            const bool row_valid = kv_idx >= 0 && kv_idx <= max_kv_i;
 
             plan.bar_dkv_part0_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
