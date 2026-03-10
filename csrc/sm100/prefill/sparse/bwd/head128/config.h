@@ -93,17 +93,17 @@ using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
 using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_INTER_Atom<bf16>{},
+    UMMA::Layout_MN_INTER_Atom<bf16>{},
     Shape<Int<B_TOPK>, Int<B_H / 2>>{},
-    Step<_1, _2>{}
+    Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
 using SmemLayoutdS = SmemLayoutS;
 
 using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_MN_INTER_Atom<bf16>{},
+    UMMA::Layout_K_INTER_Atom<bf16>{},
     Shape<Int<B_H / 2>, Int<B_TOPK>>{},
-    Step<_2, _1>{}
+    Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
 using TiledMMA_P = decltype(make_tiled_mma(
@@ -115,19 +115,19 @@ using TiledMMA_dP = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, 256, UMMA::Major::MN, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::MN, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
 ));
 
 struct tmem_cols {
@@ -153,8 +153,8 @@ struct alignas(128) SharedMemoryPlan {
 
     array_aligned<bf16, cosize_v<SmemLayoutdO>> dO;
     struct {
-        array_aligned<bf16, cosize_v<SmemLayoutS>> s;
-        array_aligned<bf16, cosize_v<SmemLayoutS>> ds;
+        array_aligned<bf16, cosize_v<SmemLayoutdSTransposed>> s;
+        array_aligned<bf16, cosize_v<SmemLayoutdSTransposed>> ds;
     } s_ds;
     char is_k_valid[B_TOPK / 8];
 
