@@ -61,11 +61,11 @@ enum class WarpRole {
 };
 
 static constexpr int kNumSoftmaxAndDQTransferWarps = 4;
-static constexpr int kNumKvTileTransferWarps = 1;
+static constexpr int kNumKvTileTransferWarps = 2;
 static constexpr int kNumDkvTransferWarps = 8;
 static constexpr int kNumMmaWarps = 1;
 static constexpr int kNumKvValidLoadWarps = 1;
-static constexpr int kNumEmptyWarps = 1;
+static constexpr int kNumEmptyWarps = 0;
 static constexpr int kThreadsPerWarp = 32;
 
 static constexpr int kSoftmaxAndDQTransferFirstWarp = 0;
@@ -78,7 +78,7 @@ static constexpr int kNumAssignedWarps =
     kNumSoftmaxAndDQTransferWarps + kNumKvTileTransferWarps + kNumDkvTransferWarps +
     kNumMmaWarps + kNumKvValidLoadWarps + kNumEmptyWarps;
 
-static constexpr unsigned long long kWarpAssignment = 0x0543'3333'3332'1111ull;
+static constexpr unsigned long long kWarpAssignment = 0x5433'3333'3322'1111ull;
 
 static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps");
 static_assert(kEmptyFirstWarp + kNumEmptyWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
@@ -467,24 +467,24 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // ========================================
     if (warp_role == WarpRole::KvTileTransfer) {
         constexpr int NUM_WARPS = kNumKvTileTransferWarps;
-        static_assert(NUM_WARPS == 1);
+        static_assert((B_TOPK / 2) % (4 * NUM_WARPS) == 0);
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
         constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;  // 32 * 576 = 18432
-        constexpr int local_warp_idx = 0;
+        const int local_warp_idx = warp_idx - kKvTileTransferFirstWarp;
 
-        // Use lane0 of the single KV tile warp to issue gather4 TMA loads.
-        if (elect_one_sync()) {
-            bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
+        // Each KV tile warp owns a disjoint subset of gather4 rows. The lead warp
+        // handles the kv_peer cp_async once the full tile has been consumed for P.
+        CUTE_NO_UNROLL
+        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+            const int phase = k_block & 1;
 
-            CUTE_NO_UNROLL
-            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-                const int phase = k_block & 1;
+            if (k_block > 0) {
+                // Keep producer/consumer order between iterations for all producer warps.
+                plan.bar_dq_ready.wait((k_block - 1) & 1);
+            }
 
-                if (k_block > 0) {
-                    // Keep producer/consumer order between iterations for all producer warps.
-                    plan.bar_dq_ready.wait((k_block - 1) & 1);
-                }
-
+            if (elect_one_sync()) {
+                bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
                 int4 indices4[NUM_LOCAL_ROWS_PER_WARP];
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -508,10 +508,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                         );
                     }
                 }
-                // Load kv_peer from peer CTA using cp_async every iteration.
-                // Wait until MMA has consumed this K block for P, then copy to kv_peer.
-                plan.bar_p_ready.wait(phase);
+            }
 
+            // All producer warps must hold this tile until the lead warp finishes
+            // the peer copy for the current block.
+            plan.bar_p_ready.wait(phase);
+            NamedBarrier::arrive_and_wait(NUM_WARPS * kThreadsPerWarp, 1);
+
+            if (local_warp_idx == 0 && elect_one_sync()) {
                 plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
                 bf16* peer_kv_peer_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv_peer.data());
                 transac_bar_t* peer_bar_ptr = kerutils::get_peer_addr(&plan.bar_kv_peer_cp_async);
@@ -522,7 +526,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     *peer_bar_ptr
                 );
                 fence_view_async_shared();
-                plan.bar_kv_peer_cp_async.wait(phase);
+            }
+
+            NamedBarrier::arrive_and_wait(NUM_WARPS * kThreadsPerWarp, 1);
+            plan.bar_kv_peer_cp_async.wait(phase);
+
+            if (local_warp_idx == 0 && elect_one_sync()) {
                 if (cta_idx == 0) {
                     plan.bar_kv_peer_ready.arrive(0u);
                 } else {
