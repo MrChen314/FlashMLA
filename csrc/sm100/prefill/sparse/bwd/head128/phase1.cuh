@@ -52,7 +52,6 @@ int32x8_t ldg_256_indices(void* src_ptr) {
 }
 
 enum class WarpRole {
-    Empty = 0x0,
     SoftmaxAndDQTransfer = 0x1,
     KvTileTransfer = 0x2,
     DkvTransfer = 0x3,
@@ -65,7 +64,6 @@ static constexpr int kNumKvTileTransferWarps = 2;
 static constexpr int kNumDkvTransferWarps = 8;
 static constexpr int kNumMmaWarps = 1;
 static constexpr int kNumKvValidLoadWarps = 1;
-static constexpr int kNumEmptyWarps = 0;
 static constexpr int kThreadsPerWarp = 32;
 
 static constexpr int kSoftmaxAndDQTransferFirstWarp = 0;
@@ -73,15 +71,15 @@ static constexpr int kKvTileTransferFirstWarp = kSoftmaxAndDQTransferFirstWarp +
 static constexpr int kDkvTransferFirstWarp = kKvTileTransferFirstWarp + kNumKvTileTransferWarps;
 static constexpr int kMmaFirstWarp = kDkvTransferFirstWarp + kNumDkvTransferWarps;
 static constexpr int kKvValidLoadFirstWarp = kMmaFirstWarp + kNumMmaWarps;
-static constexpr int kEmptyFirstWarp = kKvValidLoadFirstWarp + kNumKvValidLoadWarps;
 static constexpr int kNumAssignedWarps =
     kNumSoftmaxAndDQTransferWarps + kNumKvTileTransferWarps + kNumDkvTransferWarps +
-    kNumMmaWarps + kNumKvValidLoadWarps + kNumEmptyWarps;
+    kNumMmaWarps + kNumKvValidLoadWarps;
 
 static constexpr unsigned long long kWarpAssignment = 0x5433'3333'3322'1111ull;
+static constexpr uint32_t kTmemBase = 0;
 
 static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps");
-static_assert(kEmptyFirstWarp + kNumEmptyWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
+static_assert(kKvValidLoadFirstWarp + kNumKvValidLoadWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
 static_assert(NUM_THREADS == kNumAssignedWarps * kThreadsPerWarp, "NUM_THREADS must match warp assignment");
 
 CUTE_DEVICE
@@ -155,7 +153,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     }
     
     // Cluster sync before accessing peer SMEM - all CTAs must participate
-    __syncthreads();
     cluster_sync();
     
     // Construct SMEM Tensors
@@ -167,8 +164,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     Tensor sKNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKNoPE{});
     Tensor sKRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPE{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
-    // kv_peer: [B_TOPK/2, D_K] = [32, 576] for cross-CTA K loading
-    Tensor sKV_peer = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKV{});
 
     // Launch prologue TMA loads and allocate TMEM (warp 0 in each CTA)
     if (warp_idx == 0) {
@@ -198,6 +193,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         }
 
         TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
+        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         TMEM::Allocator2Sm().release_allocation_lock();
     }
     __syncthreads();  // Wait for TMEM allocation
@@ -223,10 +219,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         const float2 neg_delta_f2 = make_float2(neg_delta_val, neg_delta_val);
         const float2 sm_scale_f2 = make_float2(sm_scale, sm_scale);
 
-        const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
         const uint32_t tmem_lane = idx_in_softmax % S_DS_ROWS_PER_CTA;
-        const uint32_t tmem_p_addr = tmem_base + (tmem_lane << 16) + tmem_cols::P;
-        const uint32_t tmem_dp_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
+        const uint32_t tmem_p_addr = kTmemBase + (tmem_lane << 16) + tmem_cols::P;
+        const uint32_t tmem_dp_addr = kTmemBase + (tmem_lane << 16) + tmem_cols::dP;
         const int row_in_tile = idx_in_softmax % S_DS_ROWS_PER_CTA;
         const int col_half = idx_in_softmax / S_DS_ROWS_PER_CTA;
         bf16* sS_base = plan.s_ds.s.data() +
@@ -299,11 +294,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             __threadfence_block();
 
             // Step 5: Notify MMA warp that s is ready.
-            if (cta_idx == 0) {
-                plan.bar_s_ready.arrive(0u);
-            } else {
-                plan.bar_s_ready.arrive(1u);
-            }
+            plan.bar_s_ready.arrive(static_cast<uint32_t>(cta_idx));
 
             // Step 7: Wait for MMA warp to compute dP for current block.
             plan.bar_dp_ready.wait(phase);
@@ -355,11 +346,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             __threadfence_block();
 
             // Step 11: Notify MMA warp that ds is ready.
-            if (cta_idx == 0) {
-                plan.bar_ds_ready.arrive(0u);
-            } else {
-                plan.bar_ds_ready.arrive(1u);
-            }
+            plan.bar_ds_ready.arrive(static_cast<uint32_t>(cta_idx));
         }
 
         // ========================================
@@ -384,8 +371,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             const int row_in_cta = idx_in_softmax % dQ_ROWS;
             const int col_half = idx_in_softmax / dQ_ROWS;
 
-            const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
-            const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+            const uint32_t tmem_addr_dq0 = kTmemBase + (row_in_cta << 16) + tmem_cols::dQ;
+            const uint32_t tmem_addr_dq1 = kTmemBase + (row_in_cta << 16) + (tmem_cols::dQ + 128);
 
             // dQ_NoPE part0: cols [0, 255]
             CUTE_UNROLL
@@ -424,7 +411,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             // dQ_RoPE: cols [512, 575] loaded in chunks to reduce peak register use.
             constexpr int ROPE_F2_CHUNK = 8;
             constexpr int ROPE_NUM_CHUNKS = ROPE_FLOAT2_PER_ROW / ROPE_F2_CHUNK;
-            const uint32_t tmem_addr_dq_rope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
+            const uint32_t tmem_addr_dq_rope = kTmemBase + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
             CUTE_UNROLL
             for (int rch = 0; rch < ROPE_NUM_CHUNKS; ++rch) {
                 float2 dq_rope_chunk[ROPE_F2_CHUNK];
@@ -532,11 +519,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             plan.bar_kv_peer_cp_async.wait(phase);
 
             if (local_warp_idx == 0 && elect_one_sync()) {
-                if (cta_idx == 0) {
-                    plan.bar_kv_peer_ready.arrive(0u);
-                } else {
-                    plan.bar_kv_peer_ready.arrive(1u);
-                }
+                plan.bar_kv_peer_ready.arrive(static_cast<uint32_t>(cta_idx));
             }
         }
     }
@@ -588,11 +571,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     atomic_add_32floats_unrolled(dst, src);
                 }
             }
-            if (cta_idx == 0) {
-                plan.bar_dkv_part0_done.arrive(0u);
-            } else {
-                plan.bar_dkv_part0_done.arrive(1u);
-            }
+            plan.bar_dkv_part0_done.arrive(static_cast<uint32_t>(cta_idx));
 
             plan.bar_dkv_part1_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
@@ -609,11 +588,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     atomic_add_32floats_unrolled(dst, src);
                 }
             }
-            if (cta_idx == 0) {
-                plan.bar_dkv_part1_done.arrive(0u);
-            } else {
-                plan.bar_dkv_part1_done.arrive(1u);
-            }
+            plan.bar_dkv_part1_done.arrive(static_cast<uint32_t>(cta_idx));
 
             plan.bar_dkv_part2_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
@@ -627,11 +602,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 float* src = (float*)dkv_rope_data;
                 atomic_add_32floats_unrolled(dst, src);
             }
-            if (cta_idx == 0) {
-                plan.bar_dkv_part2_done.arrive(0u);
-            } else {
-                plan.bar_dkv_part2_done.arrive(1u);
-            }
+            plan.bar_dkv_part2_done.arrive(static_cast<uint32_t>(cta_idx));
         }
     }
 
@@ -809,8 +780,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part2_done.wait(final_phase);
                 ku::tcgen05_after_thread_sync();
             }
-
-            (void)sdO_t_full;
         }
     }
 
@@ -841,17 +810,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             }
         }
     }
-    if (warp_role == WarpRole::Empty) {
-        // Intentionally idle role.
-    }
-
     // All threads must sync before proceeding
-    __syncthreads();
     cluster_sync();
     
     // Free TMEM
     if (warp_idx == 0 && elect_one_sync()) {
-        TMEM::Allocator2Sm().free(plan.tmem_start_addr.data()[0], 512);
+        TMEM::Allocator2Sm().free(kTmemBase, 512);
     }
 #endif
 }
@@ -881,16 +845,6 @@ static void launch_test_mla_bwd(const SparseAttnBwdParams& params) {
             )
         ),
         SmemLayoutQRoPE{}
-    );
-
-    auto shape_KV = cute::make_shape(params.s_kv, D_K);
-    auto tma_KV = cute::make_tma_copy(
-        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
-        cute::make_tensor(
-            cute::make_gmem_ptr((bf16*)params.kv),
-            cute::make_layout(shape_KV, cute::make_stride(params.stride_kv_s_kv, cute::_1{}))
-        ),
-        SmemLayoutKV{}
     );
 
     auto shape_dO = cute::make_shape(B_H, D_V, params.s_q);
@@ -945,7 +899,6 @@ static void launch_test_mla_bwd(const SparseAttnBwdParams& params) {
     using KernelTmaParams = TmaParams<
         decltype(shape_Q_nope), decltype(tma_Q_nope),
         decltype(shape_Q_rope), decltype(tma_Q_rope),
-        decltype(shape_KV), decltype(tma_KV),
         decltype(shape_dO), decltype(tma_dO),
         decltype(shape_dQ), decltype(tma_dQ)
     >;
@@ -953,7 +906,6 @@ static void launch_test_mla_bwd(const SparseAttnBwdParams& params) {
     KernelTmaParams tma_params = {
         shape_Q_nope, tma_Q_nope,
         shape_Q_rope, tma_Q_rope,
-        shape_KV, tma_KV,
         shape_dO, tma_dO,
         shape_dQ, tma_dQ,
         tensor_map_kv

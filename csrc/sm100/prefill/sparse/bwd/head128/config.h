@@ -15,7 +15,6 @@ using namespace cute;
 template<
     typename Shape_QNoPE, typename TMA_QNoPE,
     typename Shape_QRoPE, typename TMA_QRoPE,
-    typename Shape_KV, typename TMA_KV,
     typename Shape_dO, typename TMA_dO,
     typename Shape_dQ, typename TMA_dQ
 >
@@ -24,8 +23,6 @@ struct TmaParams {
     TMA_QNoPE tma_Q_nope;
     Shape_QRoPE shape_Q_rope;
     TMA_QRoPE tma_Q_rope;
-    Shape_KV shape_KV;
-    TMA_KV tma_KV;
     Shape_dO shape_dO;
     TMA_dO tma_dO;
     Shape_dQ shape_dQ;
@@ -179,9 +176,6 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dq_ready;
 
     array_aligned<uint32_t, 1> tmem_start_addr;
-    float rowwise_max_buf[128];
-    float rowwise_li_buf[128];
-    float rowwise_delta_buf[128];
 };
 
 static constexpr size_t SMEM_SIZE = sizeof(SharedMemoryPlan);
