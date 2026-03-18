@@ -127,20 +127,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         if (elect_one_sync()) {
             Tensor gQ = flat_divide(
                 tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
-                Tile<Int<D_V / 2>>{}
-            )(_, cta_idx, _);
+                Shape<Int<B_H>, Int<D_V / 2>>{}
+            )(_, _, _0{}, cta_idx);
             ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q_nope_ready, TMA::CacheHintSm90::EVICT_FIRST);
 
-            // dKV_RoPE does not split the N dimension across CTAs, so each CTA
-            // needs the full [B_H, D_ROPE] query RoPE tile locally.
-            Tensor gQRoPE = tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx);
+            Tensor gQRoPE = flat_divide(
+                tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx),
+                Shape<Int<B_H>, Int<D_ROPE / 2>>{}
+            )(_, _, _0{}, cta_idx);
             ku::launch_tma_copy(
                 tma_params.tma_Q_rope, gQRoPE, sQRoPE, plan.bar_q_rope_ready, TMA::CacheHintSm90::EVICT_FIRST);
 
             Tensor gdO = flat_divide(
                 tma_params.tma_dO.get_tma_tensor(tma_params.shape_dO)(_, _, s_q_idx),
-                Tile<Int<D_V / 2>>{}
-            )(_, cta_idx, _);
+                Shape<Int<B_H>, Int<D_V / 2>>{}
+            )(_, _, _0{}, cta_idx);
             ku::launch_tma_copy(tma_params.tma_dO, gdO, sdO, plan.bar_dO_ready, TMA::CacheHintSm90::EVICT_FIRST);
         }
 
@@ -176,14 +177,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 const int topk_tile_idx = k_block * 2 + cta_idx;
                 Tensor gS = flat_divide(
                     tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, s_q_idx),
-                    Tile<Int<B_TOPK / 2>>{}
-                )(_, topk_tile_idx, _);
+                    Shape<Int<B_H>, Int<B_TOPK / 2>>{}
+                )(_, _, _0{}, topk_tile_idx);
                 ku::launch_tma_copy(tma_params.tma_S, gS, sS, plan.bar_s_tile_ready, TMA::CacheHintSm90::EVICT_FIRST);
 
                 Tensor gdS = flat_divide(
                     tma_params.tma_dS.get_tma_tensor(tma_params.shape_dS)(_, _, s_q_idx),
-                    Tile<Int<B_TOPK / 2>>{}
-                )(_, topk_tile_idx, _);
+                    Shape<Int<B_H>, Int<B_TOPK / 2>>{}
+                )(_, _, _0{}, topk_tile_idx);
                 ku::launch_tma_copy(tma_params.tma_dS, gdS, sDS, plan.bar_ds_tile_ready, TMA::CacheHintSm90::EVICT_FIRST);
             }
 
@@ -272,66 +273,66 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 }
 
 static void launch_dkv_phase(const SparseAttnBwdParams& params) {
-    auto shape_Q = cute::make_shape(D_V, B_H, params.s_q);
+    auto shape_Q = cute::make_shape(B_H, D_V, params.s_q);
     auto tma_Q = cute::make_tma_copy(
-        cute::SM90_TMA_LOAD{},
+        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.q),
             cute::make_layout(
                 shape_Q,
-                cute::make_stride(cute::_1{}, params.stride_q_h_q, params.stride_q_s_q)
+                cute::make_stride(params.stride_q_h_q, cute::_1{}, params.stride_q_s_q)
             )
         ),
         SmemLayoutQ{}
     );
 
-    auto shape_Q_rope = cute::make_shape(D_ROPE, B_H, params.s_q);
+    auto shape_Q_rope = cute::make_shape(B_H, D_ROPE, params.s_q);
     auto tma_Q_rope = cute::make_tma_copy(
-        cute::SM90_TMA_LOAD{},
+        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.q + D_V),
             cute::make_layout(
                 shape_Q_rope,
-                cute::make_stride(cute::_1{}, params.stride_q_h_q, params.stride_q_s_q)
+                cute::make_stride(params.stride_q_h_q, cute::_1{}, params.stride_q_s_q)
             )
         ),
         SmemLayoutQRoPE{}
     );
 
-    auto shape_dO = cute::make_shape(D_V, B_H, params.s_q);
+    auto shape_dO = cute::make_shape(B_H, D_V, params.s_q);
     auto tma_dO = cute::make_tma_copy(
-        cute::SM90_TMA_LOAD{},
+        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.dO),
             cute::make_layout(
                 shape_dO,
-                cute::make_stride(cute::_1{}, params.stride_dO_h_q, params.stride_dO_s_q)
+                cute::make_stride(params.stride_dO_h_q, cute::_1{}, params.stride_dO_s_q)
             )
         ),
         SmemLayoutdO{}
     );
 
-    auto shape_S = cute::make_shape(params.topk, B_H, params.s_q);
+    auto shape_S = cute::make_shape(B_H, params.topk, params.s_q);
     auto tma_S = cute::make_tma_copy(
         cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.s),
             cute::make_layout(
                 shape_S,
-                cute::make_stride(cute::_1{}, params.stride_s_h_q, params.stride_s_s_q)
+                cute::make_stride(params.stride_s_h_q, cute::_1{}, params.stride_s_s_q)
             )
         ),
         SmemLayoutS{}
     );
 
-    auto shape_dS = cute::make_shape(params.topk, B_H, params.s_q);
+    auto shape_dS = cute::make_shape(B_H, params.topk, params.s_q);
     auto tma_dS = cute::make_tma_copy(
         cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.ds),
             cute::make_layout(
                 shape_dS,
-                cute::make_stride(cute::_1{}, params.stride_ds_h_q, params.stride_ds_s_q)
+                cute::make_stride(params.stride_ds_h_q, cute::_1{}, params.stride_ds_s_q)
             )
         ),
         SmemLayoutdS{}
