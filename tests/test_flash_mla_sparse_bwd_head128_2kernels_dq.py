@@ -5,100 +5,141 @@ import kernelkit as kk
 import flash_mla
 
 
-def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, q_start_index_s=0):
+def calc_diff(a: torch.Tensor, b: torch.Tensor):
+    abs_diff = torch.abs(a - b)
+    max_diff = abs_diff.max().item()
+    rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item()
+    return max_diff, rel_diff
+
+
+def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True, q_start_index_s=0):
     q = q.float()
     kv = kv.float()
     indices = indices.transpose(1, 2)
     b, sq, h, dim_q = q.shape
     b, sk, g, _ = kv.shape
 
+    assert kv.shape[-1] == 576, "you should assign dim otherwise"
     dim = 512
     k = kv
     v = kv[..., :dim]
 
-    compressed_casual_mask = torch.arange(
-        q_start_index_s, q_start_index_s + sq, dtype=torch.int32, device="cuda"
-    ).view(-1, 1) >= torch.arange(0, sk, 1, dtype=torch.int32, device="cuda").view(1, -1)
+    b, _, _, dim_v = v.shape
+    g_index = g
+    h_index = h // g
+    compressed_casual_mask = torch.arange(q_start_index_s, q_start_index_s + sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
+        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
+    ).view(1, -1)
 
-    mask = q.new_zeros(b, g, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
+    mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
     mask = mask[..., :-1]
     mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
-    mask = mask.view(b, g, 1, sq, sk)
+    mask[:, :, : 1 - 1, 0] = True
+    mask = mask.view(b, g_index, 1, sq, sk)
 
     q = q.view(b, sq, g, -1, dim_q)
     score = torch.einsum("bmghd,bngd->bghmn", q, k)
-    sm_scale = dim_q ** -0.5 if sm_scale is None else sm_scale
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
     score = score.masked_fill(~mask, float("-inf")).mul(sm_scale)
     p = score.softmax(dim=-1)
-    p = p.view(b, g, h // g, -1, sq, sk)
+    p = p.view(b, g_index, h_index, -1, sq, sk)
     p = p.view(b, g, -1, sq, sk)
     o = torch.einsum("bghmn,bngd->bmghd", p.type(v.dtype), v)
-    return o.reshape(b, sq, h, dim).to(torch.bfloat16)
+    o = o.reshape(b, sq, h, dim_v)
+    return o.to(torch.bfloat16)
 
 
-def ref_sparse_mla_bwd_interface(q, kv, do, indices, sm_scale=None, q_start_index_s=0):
+def ref_sparse_mla_bwd_interface(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, q_start_index_s=0):
     q = q.detach().clone()
     kv = kv.detach().clone()
     q.requires_grad = True
     kv.requires_grad = True
-    o = ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale, q_start_index_s)
+    o = ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale, is_casual, q_start_index_s)
     o.backward(do)
     return q.grad
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_sparse_mla_bwd_head128_2kernels_dq_accuracy():
+def test_sparse_mla_bwd_head128_2kernels_dq(
+    B=1,
+    S=64,
+    SKV=256,
+    H=128,
+    HKV=1,
+    DQKV=576,
+    DV=512,
+    topk=64,
+    sm_scale=None,
+    dtype=torch.bfloat16,
+    check_correctness=True,
+    q_start_index_s=64,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
     cc_major, _ = torch.cuda.get_device_capability()
     if cc_major != 10:
         pytest.skip("head128_2kernels dq path currently targets SM100 only")
 
-    torch.manual_seed(0)
+    sm_scale = DQKV ** -0.5 if sm_scale is None else sm_scale
 
-    b = 1
-    s = 64
-    skv = 256
-    h = 128
-    hkv = 1
-    dqkv = 576
-    dv = 512
-    topk = 64
-    q_start_index_s = 64
-    sm_scale = dqkv ** -0.5
+    q = torch.randn((B, S, H, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
+    kv = torch.randn((B, SKV, HKV, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
+    do = torch.randn((B, S, H, DV), dtype=dtype, device="cuda")
 
-    q = torch.randn((b, s, h, dqkv), dtype=torch.bfloat16, device="cuda").requires_grad_(True)
-    kv = torch.randn((b, skv, hkv, dqkv), dtype=torch.bfloat16, device="cuda").requires_grad_(True)
-    do = torch.randn((b, s, h, dv), dtype=torch.bfloat16, device="cuda")
-
-    indices = torch.full((b, s, hkv, topk), skv, dtype=torch.int32, device="cuda")
-    for t in range(s):
-        max_kv_i = min(skv, q_start_index_s + t)
-        indices[0, t, 0] = torch.randperm(max_kv_i, device="cuda")[:topk]
+    indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+    for b in range(B):
+        for t in range(S):
+            for h in range(HKV):
+                max_kv_i = min(SKV, max(1, q_start_index_s + t))
+                i_i = torch.randperm(max_kv_i)[:topk]
+                indices[b, t, h, : len(i_i)] = i_i
 
     flash_out, _, flash_lse, _ = flash_mla.flash_mla_sparse_fwd(
-        q.squeeze(0).contiguous(),
-        kv.squeeze(0).contiguous(),
-        indices.squeeze(0).contiguous(),
-        sm_scale=sm_scale,
-        q_start_index_s=q_start_index_s,
+        q.squeeze(0).contiguous(), kv.squeeze(0).contiguous(), indices.squeeze(0).contiguous(),
+        sm_scale=sm_scale, q_start_index_s=q_start_index_s
     )
 
+    q_3d = q.squeeze(0)
+    kv_3d = kv.squeeze(0)
+    do_3d = do.squeeze(0)
+    indices_3d = indices.squeeze(0)
     flash_dq = flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
-        q.squeeze(0).contiguous(),
-        kv.squeeze(0).contiguous(),
-        flash_out,
-        do.squeeze(0).contiguous(),
-        indices.squeeze(0).contiguous(),
-        flash_lse,
+        q_3d, kv_3d, flash_out, do_3d, indices_3d, flash_lse,
         sm_scale=sm_scale,
         q_start_index_s=q_start_index_s,
     )
-    ref_dq = ref_sparse_mla_bwd_interface(q, kv, do, indices, sm_scale=sm_scale, q_start_index_s=q_start_index_s).squeeze(0)
+    torch.cuda.synchronize()
 
-    assert kk.check_is_allclose(
-        "dq",
-        flash_dq.float(),
-        ref_dq.float(),
-        abs_tol=1e-3,
-        rel_tol=8.01 / 128,
-        cos_diff_tol=7e-6,
+    if check_correctness:
+        ref_dq = ref_sparse_mla_bwd_interface(
+            q, kv, None, do, indices, None, sm_scale=sm_scale, q_start_index_s=q_start_index_s
+        )
+        ref_dq_3d = ref_dq.squeeze(0)
+        flash_dq_max_diff, flash_dq_rel_diff = calc_diff(flash_dq, ref_dq_3d)
+        print(f"[ref vs flash] dQ  max_diff={flash_dq_max_diff:.6f}, rel_diff={flash_dq_rel_diff:.6f}")
+
+        assert kk.check_is_allclose(
+            "dq",
+            flash_dq.float(),
+            ref_dq_3d.float(),
+            abs_tol=1e-3,
+            rel_tol=8.01 / 128,
+            cos_diff_tol=7e-6,
+        )
+
+
+if __name__ == "__main__":
+    test_sparse_mla_bwd_head128_2kernels_dq(
+        B=1,
+        S=4096,
+        SKV=8192,
+        H=128,
+        HKV=1,
+        DQKV=576,
+        DV=512,
+        topk=2048,
+        sm_scale=576 ** -0.5,
+        dtype=torch.bfloat16,
+        check_correctness=True,
+        q_start_index_s=2048,
     )
