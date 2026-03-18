@@ -97,9 +97,9 @@ using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
 using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_MN_INTER_Atom<bf16>{},
-    Shape<Int<B_TOPK>, Int<B_H / 2>>{},
-    Step<_2, _1>{}
+    UMMA::Layout_K_INTER_Atom<bf16>{},
+    Shape<Int<B_H / 2>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
 using SmemLayoutdS = SmemLayoutS;
