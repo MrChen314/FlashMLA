@@ -3,6 +3,7 @@
 #include "sparse_fwd.h"
 #include "sparse_bwd.h"
 #include "sparse_bwd_head128_2kernels.h"
+#include "sparse_bwd_head128_2kernels_dkv.h"
 #include "sparse_decode.h"
 #include "dense_decode.h"
 #include "dense_fwd.h"
@@ -14,6 +15,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
     m.def("sparse_prefill_bwd", &sparse_attn_bwd_interface);
     m.def("sparse_prefill_bwd_head128_2kernels_dq", &sparse_attn_bwd_head128_2kernels_dq_interface);
+    m.def("sparse_prefill_bwd_head128_2kernels_dkv", &sparse_attn_bwd_head128_2kernels_dkv_interface);
     // m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
     // m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
 }
