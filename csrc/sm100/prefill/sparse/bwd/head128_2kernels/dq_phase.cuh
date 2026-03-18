@@ -178,6 +178,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int SMEM_VEC_F2 = S_DS_VEC_ELEMS / 2;
         constexpr int NUM_SMEM_VEC_STORES = S_DS_COLS_PER_THREAD / S_DS_VEC_ELEMS;
         static_assert(SMEM_VEC_F2 == 4, "Softmax vectorized write path expects 4 float2 per 128-bit store.");
+        bf16x8* sS_base = reinterpret_cast<bf16x8*>(plan.s_ds.s.data()) +
+            row_in_tile + S_DS_ROWS_PER_CTA * (col_half * NUM_SMEM_VEC_STORES);
+        bf16x8* sDS_base = reinterpret_cast<bf16x8*>(plan.s_ds.ds.data()) +
+            row_in_tile + S_DS_ROWS_PER_CTA * (col_half * NUM_SMEM_VEC_STORES);
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -206,35 +210,32 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             CUTE_UNROLL
             for (int vec = 0; vec < NUM_SMEM_VEC_STORES; ++vec) {
                 const int base_idx = vec * SMEM_VEC_F2;
-                const int col_base = col_half * S_DS_COLS_PER_THREAD + vec * S_DS_VEC_ELEMS;
+                bf16x8 s_pack;
                 {
                     float2 p_vec = ku::float2_fma(p[base_idx + 0], scale_f2, neg_lse_f2);
                     p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
                     p[base_idx + 0] = p_vec;
-                    sS(row_in_tile, col_base + 0) = bf16(p_vec.x);
-                    sS(row_in_tile, col_base + 1) = bf16(p_vec.y);
+                    s_pack.a01 = __float22bfloat162_rn(p_vec);
                 }
                 {
                     float2 p_vec = ku::float2_fma(p[base_idx + 1], scale_f2, neg_lse_f2);
                     p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
                     p[base_idx + 1] = p_vec;
-                    sS(row_in_tile, col_base + 2) = bf16(p_vec.x);
-                    sS(row_in_tile, col_base + 3) = bf16(p_vec.y);
+                    s_pack.a23 = __float22bfloat162_rn(p_vec);
                 }
                 {
                     float2 p_vec = ku::float2_fma(p[base_idx + 2], scale_f2, neg_lse_f2);
                     p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
                     p[base_idx + 2] = p_vec;
-                    sS(row_in_tile, col_base + 4) = bf16(p_vec.x);
-                    sS(row_in_tile, col_base + 5) = bf16(p_vec.y);
+                    s_pack.a45 = __float22bfloat162_rn(p_vec);
                 }
                 {
                     float2 p_vec = ku::float2_fma(p[base_idx + 3], scale_f2, neg_lse_f2);
                     p_vec = make_float2(exp2f(p_vec.x), exp2f(p_vec.y));
                     p[base_idx + 3] = p_vec;
-                    sS(row_in_tile, col_base + 6) = bf16(p_vec.x);
-                    sS(row_in_tile, col_base + 7) = bf16(p_vec.y);
+                    s_pack.a67 = __float22bfloat162_rn(p_vec);
                 }
+                sS_base[S_DS_ROWS_PER_CTA * vec] = s_pack;
             }
             fence_view_async_shared();
             __threadfence_block();
@@ -270,39 +271,36 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                 ku::tcgen05_before_thread_sync();
 
                 const int base_idx = ch * DP_CHUNK_F2;
-                const int col_base = col_half * S_DS_COLS_PER_THREAD + ch * S_DS_VEC_ELEMS;
+                bf16x8 ds_pack;
                 {
                     float2 ds_vec = ku::float2_mul(
                         ku::float2_mul(p[base_idx + 0], ku::float2_add(dp[0], neg_delta_f2)),
                         sm_scale_f2
                     );
-                    sDS(row_in_tile, col_base + 0) = bf16(ds_vec.x);
-                    sDS(row_in_tile, col_base + 1) = bf16(ds_vec.y);
+                    ds_pack.a01 = __float22bfloat162_rn(ds_vec);
                 }
                 {
                     float2 ds_vec = ku::float2_mul(
                         ku::float2_mul(p[base_idx + 1], ku::float2_add(dp[1], neg_delta_f2)),
                         sm_scale_f2
                     );
-                    sDS(row_in_tile, col_base + 2) = bf16(ds_vec.x);
-                    sDS(row_in_tile, col_base + 3) = bf16(ds_vec.y);
+                    ds_pack.a23 = __float22bfloat162_rn(ds_vec);
                 }
                 {
                     float2 ds_vec = ku::float2_mul(
                         ku::float2_mul(p[base_idx + 2], ku::float2_add(dp[2], neg_delta_f2)),
                         sm_scale_f2
                     );
-                    sDS(row_in_tile, col_base + 4) = bf16(ds_vec.x);
-                    sDS(row_in_tile, col_base + 5) = bf16(ds_vec.y);
+                    ds_pack.a45 = __float22bfloat162_rn(ds_vec);
                 }
                 {
                     float2 ds_vec = ku::float2_mul(
                         ku::float2_mul(p[base_idx + 3], ku::float2_add(dp[3], neg_delta_f2)),
                         sm_scale_f2
                     );
-                    sDS(row_in_tile, col_base + 6) = bf16(ds_vec.x);
-                    sDS(row_in_tile, col_base + 7) = bf16(ds_vec.y);
+                    ds_pack.a67 = __float22bfloat162_rn(ds_vec);
                 }
+                sDS_base[S_DS_ROWS_PER_CTA * ch] = ds_pack;
             }
             fence_view_async_shared();
             __threadfence_block();
