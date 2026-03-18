@@ -148,26 +148,46 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
     if (warp_idx == 0) {
         if (elect_one_sync()) {
+            if (s_q_idx == 0) {
+                printf("==== dq dbg warp0 enter prologue_tma block=%d cta=%d ====\n", (int)blockIdx.x, cta_idx);
+            }
             Tensor gQNoPE = flat_divide(
                 tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, s_q_idx),
                 Tile<Int<B_H / 2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_nope, gQNoPE, sQNoPE, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
+            if (s_q_idx == 0) {
+                printf("==== dq dbg warp0 finish q_nope tma block=%d cta=%d ====\n", (int)blockIdx.x, cta_idx);
+            }
 
             Tensor gQRoPE = flat_divide(
                 tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx),
                 Tile<Int<B_H / 2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_rope, gQRoPE, sQRoPE, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
+            if (s_q_idx == 0) {
+                printf("==== dq dbg warp0 finish q_rope tma block=%d cta=%d ====\n", (int)blockIdx.x, cta_idx);
+            }
 
             Tensor gdO = flat_divide(
                 tma_params.tma_dO.get_tma_tensor(tma_params.shape_dO)(_, _, s_q_idx),
                 Tile<Int<B_H / 2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_dO, gdO, sdO, plan.bar_prologue_dO, TMA::CacheHintSm90::EVICT_FIRST);
+            if (s_q_idx == 0) {
+                printf("==== dq dbg warp0 finish dO tma block=%d cta=%d ====\n", (int)blockIdx.x, cta_idx);
+            }
         }
 
+        if (lane_idx == 0 && s_q_idx == 0) {
+            printf("==== dq dbg warp0 before tmem alloc block=%d cta=%d cols=%d ====\n",
+                   (int)blockIdx.x, cta_idx, tmem_cols::kNumUsedCols);
+        }
         TMEM::Allocator2Sm().allocate(tmem_cols::kNumUsedCols, plan.tmem_start_addr.data());
+        if (lane_idx == 0 && s_q_idx == 0) {
+            printf("==== dq dbg warp0 after tmem alloc block=%d cta=%d tmem_start=%u ====\n",
+                   (int)blockIdx.x, cta_idx, plan.tmem_start_addr.data()[0]);
+        }
         KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         TMEM::Allocator2Sm().release_allocation_lock();
         if (s_q_idx == 0) {
