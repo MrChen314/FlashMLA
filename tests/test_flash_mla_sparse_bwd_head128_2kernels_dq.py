@@ -127,6 +127,43 @@ def test_sparse_mla_bwd_head128_2kernels_dq(
             cos_diff_tol=7e-6,
         )
 
+    per_token_flop = 2 * sum(
+        [
+            H * DQKV * topk,
+            H * DV * topk,
+            H * DQKV * topk,
+        ]
+    )
+
+    def fn():
+        return flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
+            q_3d, kv_3d, flash_out, do_3d, indices_3d, flash_lse,
+            sm_scale=sm_scale,
+            q_start_index_s=q_start_index_s,
+        )
+
+    bench_result = kk.bench_kineto(fn, num_tests=100)
+    if kk.is_using_profiling_tools():
+        bwd_time_s = 1
+    else:
+        kernel_names = bench_result.get_kernel_names()
+        has_bwd_kernel = any("dq_phase_kernel" in name for name in kernel_names)
+        has_preprocess_kernel = any("preprocess_delta" in name for name in kernel_names)
+
+        if has_bwd_kernel and has_preprocess_kernel:
+            bwd_time_s = bench_result.get_e2e_time("preprocess_delta", "dq_phase_kernel")
+        elif has_bwd_kernel:
+            bwd_time_s = bench_result.get_kernel_time("dq_phase_kernel")
+        elif len(kernel_names) > 0:
+            bwd_time_s = bench_result.get_e2e_time(kernel_names[0], kernel_names[-1])
+        else:
+            raise RuntimeError("No CUDA kernels were captured by bench_kineto for flash_mla_sparse_bwd_head128_2kernels_dq")
+
+    ms = bwd_time_s * 1e3
+    print(f"Average time: {ms:.3f} ms")
+    print(f"bwd io bandwidth = ", (B * S * (DQKV + DV) * topk * 2) / (ms * 1e-3) / 1e12)
+    print(f"bwd tflops = ", per_token_flop * S / (ms * 1e-3) / 1e12)
+
 
 if __name__ == "__main__":
     test_sparse_mla_bwd_head128_2kernels_dq(
