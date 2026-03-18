@@ -518,6 +518,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     ku::tcgen05_after_thread_sync();
                 }
 
+                // dQ consumes dS produced by the softmax warps, so keep the
+                // same producer/consumer ordering as the fused baseline.
+                plan.bar_ds_ready.wait(phase);
+                ku::tcgen05_after_thread_sync();
+
                 if (cta_idx == 0) {
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
                     plan.bar_kv_peer_ready.wait(phase);
