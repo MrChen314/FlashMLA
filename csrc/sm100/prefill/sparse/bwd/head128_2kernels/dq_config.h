@@ -17,7 +17,9 @@ template<
     typename Shape_QNoPE, typename TMA_QNoPE,
     typename Shape_QRoPE, typename TMA_QRoPE,
     typename Shape_dO, typename TMA_dO,
-    typename Shape_dQ, typename TMA_dQ
+    typename Shape_dQ, typename TMA_dQ,
+    typename Shape_S, typename TMA_S,
+    typename Shape_dS, typename TMA_dS
 >
 struct TmaParams {
     Shape_QNoPE shape_Q_nope;
@@ -28,6 +30,10 @@ struct TmaParams {
     TMA_dO tma_dO;
     Shape_dQ shape_dQ;
     TMA_dQ tma_dQ;
+    Shape_S shape_S;
+    TMA_S tma_S;
+    Shape_dS shape_dS;
+    TMA_dS tma_dS;
     CUtensorMap tensor_map_kv;
 };
 

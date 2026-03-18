@@ -198,6 +198,10 @@ struct SparseAttnBwdParams {
     int stride_dQ_s_q; int stride_dQ_h_q;
     int stride_dKV_s_kv; int stride_dKV_h_kv;
     int stride_delta_s_q; int stride_delta_h_q;
+    cutlass::bfloat16_t* __restrict__ s;     // [s_q, h_q, topk] Softmax probabilities
+    cutlass::bfloat16_t* __restrict__ ds;    // [s_q, h_q, topk] Softmax gradients
+    int stride_s_s_q; int stride_s_h_q;
+    int stride_ds_s_q; int stride_ds_h_q;
 
     int num_sm;
     cudaStream_t stream;

@@ -275,9 +275,9 @@ def flash_mla_sparse_bwd_head128_2kernels_dq(
     d_v: int = 512,
     topk_length: Optional[torch.Tensor] = None,
     q_start_index_s: int = 0,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    DQ-only sparse attention backward kernel for the head128 two-kernel SM100 path.
+    DQ-phase sparse attention backward kernel for the head128 two-kernel SM100 path.
 
     Args:
         q: [s_q, h_q, d_qk], bfloat16
@@ -292,14 +292,18 @@ def flash_mla_sparse_bwd_head128_2kernels_dq(
         q_start_index_s: The starting position of the current chunk in the global sequence
 
     Returns:
-        dQ: [s_q, h_q, d_qk], bfloat16
+        (dQ, s, ds)
+        - dQ: [s_q, h_q, d_qk], bfloat16
+        - s: [s_q, h_q, topk], bfloat16
+        - ds: [s_q, h_q, topk], bfloat16
     """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** (-0.5)
 
-    return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
+    dQ, s, ds = flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_dq(
         q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length, q_start_index_s
     )
+    return dQ, s, ds
 
 
 def _flash_attn_varlen_forward(

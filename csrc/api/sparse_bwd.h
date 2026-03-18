@@ -167,6 +167,10 @@ static std::vector<at::Tensor> sparse_attn_bwd_interface(
         int64_stride_to_int(dQ.stride(0)), int64_stride_to_int(dQ.stride(1)),
         int64_stride_to_int(dKV.stride(0)), int64_stride_to_int(dKV.stride(1)),
         int64_stride_to_int(delta.stride(0)), int64_stride_to_int(delta.stride(1)),
+        nullptr,
+        nullptr,
+        0, 0,
+        0, 0,
 
         arch.num_sms,
         at::cuda::getCurrentCUDAStream().stream()

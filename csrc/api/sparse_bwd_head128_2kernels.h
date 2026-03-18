@@ -22,6 +22,8 @@ struct SparseBwdHead128_2KernelsDQLaunchContext {
     int d_qk;
     bool have_topk_length;
     at::Tensor dQ;
+    at::Tensor s;
+    at::Tensor ds;
     at::Tensor delta;
     SparseAttnBwdParams params;
 };
@@ -98,9 +100,13 @@ static SparseBwdHead128_2KernelsDQLaunchContext prepare_sparse_attn_bwd_head128_
 
     auto opts = q.options();
     at::Tensor dQ = torch::empty({s_q, h_q, d_qk}, opts);
+    at::Tensor s = torch::empty({s_q, h_q, topk}, opts);
+    at::Tensor ds = torch::empty({s_q, h_q, topk}, opts);
     at::Tensor delta = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat32));
 
     KU_CHECK_CONTIGUOUS(dQ);
+    KU_CHECK_CONTIGUOUS(s);
+    KU_CHECK_CONTIGUOUS(ds);
     KU_CHECK_CONTIGUOUS(delta);
 
     SparseAttnBwdParams params = {
@@ -128,6 +134,10 @@ static SparseBwdHead128_2KernelsDQLaunchContext prepare_sparse_attn_bwd_head128_
         int64_stride_to_int(dQ.stride(0)), int64_stride_to_int(dQ.stride(1)),
         0, 0,
         int64_stride_to_int(delta.stride(0)), int64_stride_to_int(delta.stride(1)),
+        (bf16*)s.data_ptr(),
+        (bf16*)ds.data_ptr(),
+        int64_stride_to_int(s.stride(0)), int64_stride_to_int(s.stride(1)),
+        int64_stride_to_int(ds.stride(0)), int64_stride_to_int(ds.stride(1)),
 
         num_sm,
         stream
@@ -138,6 +148,8 @@ static SparseBwdHead128_2KernelsDQLaunchContext prepare_sparse_attn_bwd_head128_
         d_qk,
         have_topk_length,
         dQ,
+        s,
+        ds,
         delta,
         params
     };
@@ -165,7 +177,7 @@ static std::vector<BwdFeatures> build_sparse_bwd_head128_2kernels_required_featu
     return required_features;
 }
 
-static at::Tensor sparse_attn_bwd_head128_2kernels_dq_interface(
+static std::vector<at::Tensor> sparse_attn_bwd_head128_2kernels_dq_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &o,
@@ -198,5 +210,5 @@ static at::Tensor sparse_attn_bwd_head128_2kernels_dq_interface(
         TORCH_CHECK(false, "Sparse attention backward currently only supports h_q=128. Got h_q=", ctx.h_q);
     }
 
-    return ctx.dQ;
+    return {ctx.dQ, ctx.s, ctx.ds};
 }

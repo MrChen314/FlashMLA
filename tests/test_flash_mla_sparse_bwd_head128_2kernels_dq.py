@@ -59,6 +59,68 @@ def ref_sparse_mla_bwd_interface(q, kv, o, do, indices, lse, sm_scale=None, is_c
     return q.grad
 
 
+def ref_sparse_mla_sd_interface(q, kv, do, indices, sm_scale=None, d_v=512, q_start_index_s=0, q_chunk_size=32):
+    q = q.float()
+    kv = kv.float()
+    do = do.float()
+
+    b, sq, h, dim_q = q.shape
+    _, skv, g, dim_kv = kv.shape
+    topk = indices.shape[-1]
+
+    assert h % g == 0, "h_q must be divisible by h_kv"
+    assert dim_kv >= d_v, "kv head dim must be >= value dim"
+
+    grouped_heads = h // g
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
+
+    q = q.view(b, sq, g, grouped_heads, dim_q)
+    do = do.view(b, sq, g, grouped_heads, d_v)
+
+    batch_idx = torch.arange(b, device=q.device).view(b, 1, 1, 1)
+    group_idx = torch.arange(g, device=q.device).view(1, 1, g, 1)
+
+    s_chunks = []
+    ds_chunks = []
+    for q_begin in range(0, sq, q_chunk_size):
+        q_end = min(q_begin + q_chunk_size, sq)
+        q_chunk = q[:, q_begin:q_end]
+        do_chunk = do[:, q_begin:q_end]
+        indices_chunk = indices[:, q_begin:q_end]
+
+        safe_indices = indices_chunk.long().clamp(min=0, max=max(skv - 1, 0))
+        gathered_kv = kv[batch_idx, safe_indices, group_idx]
+        gathered_v = gathered_kv[..., :d_v]
+
+        logits = torch.einsum("bnghd,bngtd->bnght", q_chunk, gathered_kv).mul(sm_scale)
+        dp = torch.einsum("bnghd,bngtd->bnght", do_chunk, gathered_v)
+
+        causal_limit = torch.arange(
+            q_start_index_s + q_begin,
+            q_start_index_s + q_end,
+            dtype=indices.dtype,
+            device=indices.device,
+        ).view(1, q_end - q_begin, 1, 1)
+        valid_mask = (indices_chunk >= 0) & (indices_chunk < skv) & (indices_chunk <= causal_limit)
+        valid_mask = valid_mask.unsqueeze(3).expand(-1, -1, -1, grouped_heads, -1)
+
+        logits = logits.masked_fill(~valid_mask, float("-inf"))
+        lse = torch.logsumexp(logits, dim=-1)
+        lonely_q_mask = lse == float("-inf")
+        lse_for_prob = lse.clone()
+        lse_for_prob[lonely_q_mask] = float("+inf")
+
+        s_chunk = torch.exp(logits - lse_for_prob.unsqueeze(-1))
+        o_chunk = torch.einsum("bnght,bngtd->bnghd", s_chunk.type(gathered_v.dtype), gathered_v)
+        delta = (o_chunk * do_chunk).sum(dim=-1, keepdim=True)
+        ds_chunk = s_chunk * (dp - delta) * sm_scale
+
+        s_chunks.append(s_chunk.reshape(b, q_end - q_begin, h, topk).to(torch.bfloat16))
+        ds_chunks.append(ds_chunk.reshape(b, q_end - q_begin, h, topk).to(torch.bfloat16))
+
+    return torch.cat(s_chunks, dim=1), torch.cat(ds_chunks, dim=1)
+
+
 def test_sparse_mla_bwd_head128_2kernels_dq(
     B=1,
     S=64,
@@ -103,7 +165,7 @@ def test_sparse_mla_bwd_head128_2kernels_dq(
     kv_3d = kv.squeeze(0)
     do_3d = do.squeeze(0)
     indices_3d = indices.squeeze(0)
-    flash_dq = flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
+    flash_dq, flash_s, flash_ds = flash_mla.flash_mla_sparse_bwd_head128_2kernels_dq(
         q_3d, kv_3d, flash_out, do_3d, indices_3d, flash_lse,
         sm_scale=sm_scale,
         q_start_index_s=q_start_index_s,
@@ -114,14 +176,39 @@ def test_sparse_mla_bwd_head128_2kernels_dq(
         ref_dq = ref_sparse_mla_bwd_interface(
             q, kv, None, do, indices, None, sm_scale=sm_scale, q_start_index_s=q_start_index_s
         )
+        ref_s, ref_ds = ref_sparse_mla_sd_interface(
+            q, kv, do, indices, sm_scale=sm_scale, d_v=DV, q_start_index_s=q_start_index_s
+        )
         ref_dq_3d = ref_dq.squeeze(0)
+        ref_s_3d = ref_s.squeeze(0)
+        ref_ds_3d = ref_ds.squeeze(0)
         flash_dq_max_diff, flash_dq_rel_diff = calc_diff(flash_dq, ref_dq_3d)
+        flash_s_max_diff, flash_s_rel_diff = calc_diff(flash_s, ref_s_3d)
+        flash_ds_max_diff, flash_ds_rel_diff = calc_diff(flash_ds, ref_ds_3d)
         print(f"[ref vs flash] dQ  max_diff={flash_dq_max_diff:.6f}, rel_diff={flash_dq_rel_diff:.6f}")
+        print(f"[ref vs flash] s   max_diff={flash_s_max_diff:.6f}, rel_diff={flash_s_rel_diff:.6f}")
+        print(f"[ref vs flash] ds  max_diff={flash_ds_max_diff:.6f}, rel_diff={flash_ds_rel_diff:.6f}")
 
         assert kk.check_is_allclose(
             "dq",
             flash_dq.float(),
             ref_dq_3d.float(),
+            abs_tol=1e-3,
+            rel_tol=8.01 / 128,
+            cos_diff_tol=7e-6,
+        )
+        assert kk.check_is_allclose(
+            "s",
+            flash_s.float(),
+            ref_s_3d.float(),
+            abs_tol=1e-3,
+            rel_tol=8.01 / 128,
+            cos_diff_tol=7e-6,
+        )
+        assert kk.check_is_allclose(
+            "ds",
+            flash_ds.float(),
+            ref_ds_3d.float(),
             abs_tol=1e-3,
             rel_tol=8.01 / 128,
             cos_diff_tol=7e-6,

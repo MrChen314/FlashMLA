@@ -97,6 +97,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dO.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dQ.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_S.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_dS.get_tma_descriptor());
         cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
     }
 
@@ -153,6 +155,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
 
     if (warp_role == WarpRole::SoftmaxAndDQTransfer) {
+        Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
+        Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
         const int idx_in_softmax = (warp_idx - kSoftmaxAndDQTransferFirstWarp) * kThreadsPerWarp + lane_idx;
         const int global_row_idx = cta_idx * (B_H / 2) + idx_in_softmax % (B_H / 2);
         const float row_lse = __ldg(lse_s + global_row_idx) * 1.44269504f;
@@ -238,6 +242,22 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             __threadfence_block();
 
             plan.bar_s_ready.arrive(static_cast<uint32_t>(cta_idx));
+            NamedBarrier::arrive_and_wait(128, 2);
+            if (warp_idx == 0 && elect_one_sync()) {
+                Tensor gS = flat_divide(
+                    tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, s_q_idx),
+                    Shape<Int<B_H / 2>, Int<B_TOPK>>{}
+                )(_, _, cta_idx, k_block);
+                auto thr_tma_s = tma_params.tma_S.get_slice(_0{});
+                cute::copy(
+                    tma_params.tma_S,
+                    thr_tma_s.partition_S(sS),
+                    thr_tma_s.partition_D(gS)
+                );
+                cute::tma_store_arrive();
+                cute::tma_store_wait<0>();
+            }
+            NamedBarrier::arrive_and_wait(128, 2);
 
             plan.bar_dp_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
@@ -287,6 +307,22 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             __threadfence_block();
 
             plan.bar_ds_ready.arrive(static_cast<uint32_t>(cta_idx));
+            NamedBarrier::arrive_and_wait(128, 3);
+            if (warp_idx == 0 && elect_one_sync()) {
+                Tensor gdS = flat_divide(
+                    tma_params.tma_dS.get_tma_tensor(tma_params.shape_dS)(_, _, s_q_idx),
+                    Shape<Int<B_H / 2>, Int<B_TOPK>>{}
+                )(_, _, cta_idx, k_block);
+                auto thr_tma_ds = tma_params.tma_dS.get_slice(_0{});
+                cute::copy(
+                    tma_params.tma_dS,
+                    thr_tma_ds.partition_S(sDS),
+                    thr_tma_ds.partition_D(gdS)
+                );
+                cute::tma_store_arrive();
+                cute::tma_store_wait<0>();
+            }
+            NamedBarrier::arrive_and_wait(128, 3);
         }
 
         const int final_phase = (num_k_blocks - 1) & 1;
@@ -637,6 +673,32 @@ static void launch_dq_phase(const SparseAttnBwdParams& params) {
         SmemLayoutQ{}
     );
 
+    auto shape_S = cute::make_shape(B_H, params.topk, params.s_q);
+    auto tma_S = cute::make_tma_copy(
+        cute::SM90_TMA_STORE{},
+        cute::make_tensor(
+            cute::make_gmem_ptr((bf16*)params.s),
+            cute::make_layout(
+                shape_S,
+                cute::make_stride(params.stride_s_h_q, cute::_1{}, params.stride_s_s_q)
+            )
+        ),
+        SmemLayoutS{}
+    );
+
+    auto shape_dS = cute::make_shape(B_H, params.topk, params.s_q);
+    auto tma_dS = cute::make_tma_copy(
+        cute::SM90_TMA_STORE{},
+        cute::make_tensor(
+            cute::make_gmem_ptr((bf16*)params.ds),
+            cute::make_layout(
+                shape_dS,
+                cute::make_stride(params.stride_ds_h_q, cute::_1{}, params.stride_ds_s_q)
+            )
+        ),
+        SmemLayoutdS{}
+    );
+
     CUtensorMap tensor_map_kv;
     {
         uint64_t size[2] = {(uint64_t)D_K, (unsigned long)params.s_kv};
@@ -664,7 +726,9 @@ static void launch_dq_phase(const SparseAttnBwdParams& params) {
         decltype(shape_Q_nope), decltype(tma_Q_nope),
         decltype(shape_Q_rope), decltype(tma_Q_rope),
         decltype(shape_dO), decltype(tma_dO),
-        decltype(shape_dQ), decltype(tma_dQ)
+        decltype(shape_dQ), decltype(tma_dQ),
+        decltype(shape_S), decltype(tma_S),
+        decltype(shape_dS), decltype(tma_dS)
     >;
 
     KernelTmaParams tma_params = {
@@ -672,6 +736,8 @@ static void launch_dq_phase(const SparseAttnBwdParams& params) {
         shape_Q_rope, tma_Q_rope,
         shape_dO, tma_dO,
         shape_dQ, tma_dQ,
+        shape_S, tma_S,
+        shape_dS, tma_dS,
         tensor_map_kv
     };
 
