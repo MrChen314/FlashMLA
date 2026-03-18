@@ -57,8 +57,6 @@ static constexpr int kNumAssignedWarps =
     kNumMmaWarps + kNumKvValidLoadWarps;
 static constexpr unsigned long long kWarpAssignment = 0x5433'3333'3322'1111ull;
 
-static constexpr uint32_t kTmemBase = 0;
-
 static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps");
 static_assert(kKvValidLoadFirstWarp + kNumKvValidLoadWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
 static_assert(NUM_THREADS == kNumAssignedWarps * kThreadsPerWarp, "NUM_THREADS must match warp assignment");
@@ -180,24 +178,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         }
 
         if (lane_idx == 0 && s_q_idx == 0) {
-            printf("==== dq dbg warp0 before tmem alloc block=%d cta=%d cols=%d ====\n",
-                   (int)blockIdx.x, cta_idx, tmem_cols::kNumUsedCols);
+            printf("==== dq dbg warp0 before tmem alloc block=%d cta=%d cols=%d logical_used=%d ====\n",
+                   (int)blockIdx.x, cta_idx, 512, tmem_cols::kNumUsedCols);
         }
-        TMEM::Allocator2Sm().allocate(tmem_cols::kNumUsedCols, plan.tmem_start_addr.data());
+        TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
         if (lane_idx == 0 && s_q_idx == 0) {
             printf("==== dq dbg warp0 after tmem alloc block=%d cta=%d tmem_start=%u ====\n",
                    (int)blockIdx.x, cta_idx, plan.tmem_start_addr.data()[0]);
         }
-        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         TMEM::Allocator2Sm().release_allocation_lock();
         if (s_q_idx == 0) {
-            printf("==== dq dbg finish tmem alloc block=%d cta=%d tmem_start=%u cols=%d ====\n",
-                   (int)blockIdx.x, cta_idx, plan.tmem_start_addr.data()[0], tmem_cols::kNumUsedCols);
+            printf("==== dq dbg finish tmem alloc block=%d cta=%d tmem_start=%u cols=%d logical_used=%d ====\n",
+                   (int)blockIdx.x, cta_idx, plan.tmem_start_addr.data()[0], 512, tmem_cols::kNumUsedCols);
         }
     }
     __syncthreads();
+    const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
     if (dbg_tid0) {
-        printf("==== dq dbg finish prologue block=%d cta=%d ====\n", (int)blockIdx.x, cta_idx);
+        printf("==== dq dbg finish prologue block=%d cta=%d tmem_base=%u ====\n",
+               (int)blockIdx.x, cta_idx, tmem_base);
     }
 
     if (warp_role == WarpRole::SoftmaxAndDQTransfer) {
@@ -214,8 +213,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         const float2 sm_scale_f2 = make_float2(sm_scale, sm_scale);
 
         const uint32_t tmem_lane = idx_in_softmax % S_DS_ROWS_PER_CTA;
-        const uint32_t tmem_p_addr = kTmemBase + (tmem_lane << 16) + tmem_cols::P;
-        const uint32_t tmem_dp_addr = kTmemBase + (tmem_lane << 16) + tmem_cols::dP;
+        const uint32_t tmem_p_addr = tmem_base + (tmem_lane << 16) + tmem_cols::P;
+        const uint32_t tmem_dp_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
         const int row_in_tile = idx_in_softmax % S_DS_ROWS_PER_CTA;
         const int col_half = idx_in_softmax / S_DS_ROWS_PER_CTA;
         bf16* sS_base = plan.s_ds.s.data() +
@@ -369,8 +368,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             const int row_in_cta = idx_in_softmax % dQ_ROWS;
             const int col_half = idx_in_softmax / dQ_ROWS;
 
-            const uint32_t tmem_addr_dq0 = kTmemBase + (row_in_cta << 16) + tmem_cols::dQ;
-            const uint32_t tmem_addr_dq1 = kTmemBase + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+            const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
+            const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
 
             CUTE_UNROLL
             for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
@@ -406,7 +405,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             constexpr int ROPE_F2_CHUNK = 8;
             constexpr int ROPE_NUM_CHUNKS = ROPE_FLOAT2_PER_ROW / ROPE_F2_CHUNK;
-            const uint32_t tmem_addr_dq_rope = kTmemBase + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
+            const uint32_t tmem_addr_dq_rope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
             CUTE_UNROLL
             for (int rch = 0; rch < ROPE_NUM_CHUNKS; ++rch) {
                 float2 dq_rope_chunk[ROPE_F2_CHUNK];
@@ -698,7 +697,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     }
 
     if (warp_idx == 0 && elect_one_sync()) {
-        TMEM::Allocator2Sm().free(kTmemBase, tmem_cols::kNumUsedCols);
+        TMEM::Allocator2Sm().free(tmem_base, 512);
         if (dbg_tid0) {
             printf("==== dq dbg finish tmem free block=%d cta=%d ====\n", (int)blockIdx.x, cta_idx);
         }
