@@ -131,10 +131,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q_nope_ready, TMA::CacheHintSm90::EVICT_FIRST);
 
-            Tensor gQRoPE = flat_divide(
-                tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx),
-                Tile<Int<D_ROPE / 2>>{}
-            )(_, cta_idx, _);
+            // dKV_RoPE does not split the N dimension across CTAs, so each CTA
+            // needs the full [B_H, D_ROPE] query RoPE tile locally.
+            Tensor gQRoPE = tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx);
             ku::launch_tma_copy(
                 tma_params.tma_Q_rope, gQRoPE, sQRoPE, plan.bar_q_rope_ready, TMA::CacheHintSm90::EVICT_FIRST);
 
@@ -275,7 +274,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 static void launch_dkv_phase(const SparseAttnBwdParams& params) {
     auto shape_Q = cute::make_shape(D_V, B_H, params.s_q);
     auto tma_Q = cute::make_tma_copy(
-        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
+        cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.q),
             cute::make_layout(
@@ -288,7 +287,7 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
 
     auto shape_Q_rope = cute::make_shape(D_ROPE, B_H, params.s_q);
     auto tma_Q_rope = cute::make_tma_copy(
-        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
+        cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.q + D_V),
             cute::make_layout(
@@ -301,7 +300,7 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
 
     auto shape_dO = cute::make_shape(D_V, B_H, params.s_q);
     auto tma_dO = cute::make_tma_copy(
-        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
+        cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.dO),
             cute::make_layout(
@@ -314,7 +313,7 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
 
     auto shape_S = cute::make_shape(params.topk, B_H, params.s_q);
     auto tma_S = cute::make_tma_copy(
-        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
+        cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.s),
             cute::make_layout(
@@ -327,7 +326,7 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
 
     auto shape_dS = cute::make_shape(params.topk, B_H, params.s_q);
     auto tma_dS = cute::make_tma_copy(
-        cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
+        cute::SM90_TMA_LOAD{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)params.ds),
             cute::make_layout(
