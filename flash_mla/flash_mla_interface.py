@@ -339,6 +339,49 @@ def flash_mla_sparse_bwd_head128_2kernels_dkv(
     )
 
 
+def flash_mla_sparse_bwd_head128_2kernels_fused(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    o: torch.Tensor,
+    dO: torch.Tensor,
+    indices: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: Optional[float] = None,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+    q_start_index_s: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused host entry for the head128 two-kernel SM100 backward path.
+
+    This API launches the DQ phase first and then reuses the produced `s/ds`
+    scratch tensors to launch the DKV phase on the same stream.
+
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16
+        o: [s_q, h_q, d_v], bfloat16
+        dO: [s_q, h_q, d_v], bfloat16
+        indices: [s_q, h_kv, topk], int32
+        lse: [s_q, h_q], float32
+        sm_scale: optional float - Softmax scaling factor. If None, defaults to q.shape[-1] ** -0.5
+        d_v: int - Value dimension, must be 512
+        topk_length: optional, [s_q], int32 - Optional TopK length
+        q_start_index_s: The starting position of the current chunk in the global sequence
+
+    Returns:
+        (dQ, dKV)
+        - dQ: [s_q, h_q, d_qk], bfloat16
+        - dKV: [s_kv, h_kv, d_qk], bfloat16
+    """
+    if sm_scale is None:
+        sm_scale = q.shape[-1] ** (-0.5)
+
+    return flash_mla_cuda.sparse_prefill_bwd_head128_2kernels_fused(
+        q, kv, o, dO, indices, lse, sm_scale, d_v, topk_length, q_start_index_s
+    )
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

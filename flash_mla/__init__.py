@@ -9,7 +9,8 @@ from flash_mla.flash_mla_interface import (
     flash_mla_sparse_fwd,
     flash_mla_sparse_bwd,
     flash_mla_sparse_bwd_head128_2kernels_dq,
-    flash_mla_sparse_bwd_head128_2kernels_dkv
+    flash_mla_sparse_bwd_head128_2kernels_dkv,
+    flash_mla_sparse_bwd_head128_2kernels_fused
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "flash_mla_sparse_fwd",
     "flash_mla_sparse_bwd",
     "flash_mla_sparse_bwd_head128_2kernels_dq",
-    "flash_mla_sparse_bwd_head128_2kernels_dkv"
+    "flash_mla_sparse_bwd_head128_2kernels_dkv",
+    "flash_mla_sparse_bwd_head128_2kernels_fused"
 ]
