@@ -2,6 +2,7 @@
 
 #include "dkv_config.h"
 
+#include <cstdio>
 #include <cstring>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/arch.h>
@@ -60,6 +61,7 @@ static constexpr int kNumAssignedWarps =
     kNumSoftmaxAndDQTransferWarps + kNumKvTileTransferWarps +
     kNumDkvTransferWarps + kNumMmaWarps + kNumKvValidLoadWarps;
 static constexpr unsigned long long kWarpAssignment = 0x5433'3333'3322'1111ull;
+static constexpr bool kDebugDKVKernel = true;
 
 static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps");
 static_assert(kKvValidLoadFirstWarp + kNumKvValidLoadWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
@@ -95,6 +97,22 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         min(max(__ldg(params.topk_length + s_q_idx), 0), params.topk);
     const int32_t* gIndices_s = params.indices + (int64_t)s_q_idx * params.stride_indices_s_q;
     const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);
+
+    if constexpr (kDebugDKVKernel) {
+        if (tid == 0 && s_q_idx == 0) {
+            printf(
+                "[dkv] enter cta=%d topk_length=%d num_k_blocks=%d stride_q_h=%d stride_dO_h=%d stride_s_h=%d stride_ds_h=%d stride_dKV=%d\n",
+                cta_idx,
+                topk_length,
+                num_k_blocks,
+                params.stride_q_h_q,
+                params.stride_dO_h_q,
+                params.stride_s_h_q,
+                params.stride_ds_h_q,
+                params.stride_dKV_s_kv
+            );
+        }
+    }
 
     if (tid == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
@@ -159,6 +177,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
     __syncthreads();
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
+
+    if constexpr (kDebugDKVKernel) {
+        if (tid == 0 && s_q_idx == 0) {
+            printf("[dkv] prologue_done cta=%d tmem_base=%u\n", cta_idx, tmem_base);
+        }
+    }
+
     cluster_sync();
 
     TiledMMA_dKV tiled_mma_dKV{};
@@ -199,6 +224,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         cluster_sync();
 
         if (warp_role == WarpRole::Mma && cta_idx == 0 && elect_one_sync()) {
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0) {
+                    printf("[dkv] mma_issue phase=%d k_block=%d\n", phase, k_block);
+                }
+            }
             ku::utcmma_ss(tiled_mma_dKV, sS, sdO, tdKV, true);
             ku::utcmma_ss(tiled_mma_dKV, sDS, sQ, tdKV, false);
             ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, 1 | 2);
@@ -207,6 +237,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS, sQRoPE, tdKV_RoPE, true);
             ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, 1 | 2);
             ku::tcgen05_after_thread_sync();
+
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0) {
+                    printf("[dkv] mma_done phase=%d k_block=%d\n", phase, k_block);
+                }
+            }
         }
 
         if (warp_role == WarpRole::DkvTransfer) {
@@ -221,6 +257,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 kv_idx = __ldg(gIndices_s + row_global);
             }
             const bool row_valid = kv_idx >= 0 && kv_idx < params.s_kv && kv_idx <= max_kv_i;
+
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0 && k_block == 0 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0) {
+                    printf(
+                        "[dkv] transfer_begin cta=%d row_global=%d kv_idx=%d row_valid=%d half=%d chunk_group=%d\n",
+                        cta_idx,
+                        row_global,
+                        kv_idx,
+                        int(row_valid),
+                        half,
+                        chunk_group
+                    );
+                }
+            }
 
             plan.bar_dkv_nope_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
@@ -244,6 +294,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
                 }
             }
+
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0 && k_block == 0 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0) {
+                    printf("[dkv] transfer_nope_done cta=%d\n", cta_idx);
+                }
+            }
             plan.bar_dkv_rope_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
             constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
@@ -254,6 +310,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             if (row_valid && chunk_group == 0) {
                 float* dst = params.dKV + kv_idx * params.stride_dKV_s_kv + D_V + half * ROPE_COLS_PER_HALF;
                 atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_rope_data));
+            }
+
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0 && k_block == 0 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0) {
+                    printf("[dkv] transfer_rope_done cta=%d\n", cta_idx);
+                }
             }
         }
 
