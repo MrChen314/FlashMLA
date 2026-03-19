@@ -61,7 +61,7 @@ using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
 using SmemLayoutdO = SmemLayoutQNoPE;
 
 using SmemLayoutQRoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
+    UMMA::Layout_K_SW64_Atom<bf16>{},
     Shape<Int<B_H>, Int<ROPE_COLS_PER_CTA>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
@@ -75,7 +75,7 @@ using SmemLayoutQNoPE_MMA = decltype(coalesce(tile_to_shape(
 using SmemLayoutdO_MMA = SmemLayoutQNoPE_MMA;
 
 using SmemLayoutQRoPE_MMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_MN_SW128_Atom<bf16>{},
+    UMMA::Layout_MN_SW64_Atom<bf16>{},
     Shape<Int<ROPE_COLS_PER_CTA>, Int<B_H>>{},
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
