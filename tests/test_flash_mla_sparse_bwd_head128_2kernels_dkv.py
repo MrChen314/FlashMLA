@@ -130,13 +130,13 @@ def test_sparse_mla_bwd_head128_2kernels_dkv(
             q_start_index_s=q_start_index_s,
             topk_length=topk_length,
         )
-        flash_dkv_max_diff, flash_dkv_rel_diff = calc_diff(flash_dkv.float(), ref_dkv)
+        flash_dkv_max_diff, flash_dkv_rel_diff = calc_diff(flash_dkv, ref_dkv.bfloat16())
         print(f"[ref vs flash] dKV max_diff={flash_dkv_max_diff:.6f}, rel_diff={flash_dkv_rel_diff:.6f}")
 
         assert kk.check_is_allclose(
             "dkv",
-            flash_dkv.float(),
-            ref_dkv,
+            flash_dkv,
+            ref_dkv.bfloat16(),
             abs_tol=1e-3,
             rel_tol=8.01 / 128,
             cos_diff_tol=7e-6,
