@@ -193,15 +193,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
 
     if (warp_idx == kControlWarp && elect_one_sync()) {
-        plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
-        plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
-        plan.bar_dO_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
+        if (cta_idx == 0) {
+            plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
+            plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
+            plan.bar_dO_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
 
-        plan.bar_q_nope_ready.wait(0);
-        plan.bar_q_rope_ready.wait(0);
-        plan.bar_dO_ready.wait(0);
-        ku::tcgen05_after_thread_sync();
-        DKV_DEBUG_PRINT(blockIdx.x < 2, "prologue wait done cta=%d tmem_base=%u", cta_idx, tmem_base);
+            plan.bar_q_nope_ready.wait(0);
+            plan.bar_q_rope_ready.wait(0);
+            plan.bar_dO_ready.wait(0);
+            ku::tcgen05_after_thread_sync();
+            DKV_DEBUG_PRINT(blockIdx.x < 2, "prologue wait done cta=%d tmem_base=%u", cta_idx, tmem_base);
+        }
     }
 
     DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "before prologue cluster_sync block=%d cta=%d", (int)blockIdx.x, cta_idx);
@@ -232,12 +234,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 TMA::CacheHintSm90::EVICT_FIRST
             );
 
-            plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-            plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-            plan.bar_s_ready.wait(phase);
-            plan.bar_ds_ready.wait(phase);
-            ku::tcgen05_after_thread_sync();
-            DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d launch S/dS done phase=%d", k_pair, cta_idx, phase);
+            if (cta_idx == 0) {
+                plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+                plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+                plan.bar_s_ready.wait(phase);
+                plan.bar_ds_ready.wait(phase);
+                ku::tcgen05_after_thread_sync();
+                DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d launch S/dS done phase=%d", k_pair, cta_idx, phase);
+            }
         }
 
         DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "pair=%d cta=%d before main cluster_sync", k_pair, cta_idx);
