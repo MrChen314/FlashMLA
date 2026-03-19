@@ -39,16 +39,16 @@ static constexpr int D_K = D_QK;
 static constexpr int D_V = 512;
 static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int B_H = 128;
-static constexpr int TOPK_SUPPORTED = 128;
-static constexpr int DKV_TILE_M = TOPK_SUPPORTED;
+static constexpr int TOPK_GRANULARITY = 128;
+static constexpr int DKV_TILE_M = TOPK_GRANULARITY;
 static constexpr int DKV_ROWS_PER_CTA = DKV_TILE_M / 2;
 static constexpr int NOPE_COLS_PER_CTA = 256;
 static constexpr int ROPE_COLS_PER_CTA = D_ROPE / 2;
 static constexpr int NUM_THREADS = 16 * 32;
 
-static_assert(DKV_TILE_M == B_H, "dKV paired tile expects topk=128 and h_q=128.");
+static_assert(DKV_TILE_M == B_H, "dKV paired tile expects 128-row MMA tiles.");
 static_assert(DKV_ROWS_PER_CTA == 64, "Each CTA in the dKV kernel owns 64 rows.");
-static_assert(TOPK_SUPPORTED == 2 * DKV_ROWS_PER_CTA, "The paired dKV tile must be split evenly across two CTAs.");
+static_assert(TOPK_GRANULARITY == 2 * DKV_ROWS_PER_CTA, "The paired dKV tile must be split evenly across two CTAs.");
 static_assert(NOPE_COLS_PER_CTA * 2 == D_V, "NoPE staging must cover the full 512-dim latent width across the cluster.");
 static_assert(ROPE_COLS_PER_CTA * 2 == D_ROPE, "RoPE staging must cover the full rope width across the cluster.");
 
