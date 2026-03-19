@@ -73,7 +73,19 @@ static_assert(D_dK_tQ0 + D_dK_tQ1 + D_dK_sQ == D_Q);
 // We keep the 2CTA MMA path, but stage operands in baseline-style MN-major
 // layouts first to prioritize correctness over layout tuning.
 template<int N_GLOBAL>
-using SmemLayoutOperandBTiles = decltype(ku::make_umma_canonical_mn_major_layout<N_GLOBAL / 2, B_H, 128>());
+using SmemLayoutOperandBTiles = decltype([]() {
+    constexpr int CTA_LOCAL_N = N_GLOBAL / 2;
+    if constexpr (CTA_LOCAL_N % size<0>(UMMA::Layout_MN_SW128_Atom<bf16>{}) == 0) {
+        return ku::make_umma_canonical_mn_major_layout<CTA_LOCAL_N, B_H, 128>();
+    } else if constexpr (CTA_LOCAL_N % size<0>(UMMA::Layout_MN_SW64_Atom<bf16>{}) == 0) {
+        return ku::make_umma_canonical_mn_major_layout<CTA_LOCAL_N, B_H, 64>();
+    } else if constexpr (CTA_LOCAL_N % size<0>(UMMA::Layout_MN_SW32_Atom<bf16>{}) == 0) {
+        return ku::make_umma_canonical_mn_major_layout<CTA_LOCAL_N, B_H, 32>();
+    } else {
+        static_assert(CTA_LOCAL_N % size<0>(UMMA::Layout_MN_INTER_Atom<bf16>{}) == 0);
+        return ku::make_umma_canonical_mn_major_layout<CTA_LOCAL_N, B_H, 0>();
+    }
+}());
 
 template<int M_GLOBAL>
 using SmemLayoutOperandATiles = decltype(ku::make_umma_canonical_mn_major_layout<M_GLOBAL / 2, B_H, 0>());
