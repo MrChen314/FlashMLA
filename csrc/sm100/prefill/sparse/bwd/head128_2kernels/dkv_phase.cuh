@@ -62,6 +62,7 @@ static constexpr int kNumAssignedWarps =
     kNumDkvTransferWarps + kNumMmaWarps + kNumKvValidLoadWarps;
 static constexpr unsigned long long kWarpAssignment = 0x5433'3333'3322'1111ull;
 static constexpr bool kDebugDKVKernel = true;
+static constexpr bool kDebugDKVHost = true;
 
 static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps");
 static_assert(kKvValidLoadFirstWarp + kNumKvValidLoadWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
@@ -163,9 +164,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             ku::launch_tma_copy(tma_params.tma_dO, gdO, sdO, plan.bar_dO_ready, TMA::CacheHintSm90::EVICT_FIRST);
         }
 
-        plan.bar_q_nope_ready.arrive_and_expect_tx((D_V / 2) * B_H * sizeof(bf16));
-        plan.bar_q_rope_ready.arrive_and_expect_tx((D_ROPE / 2) * B_H * sizeof(bf16));
-        plan.bar_dO_ready.arrive_and_expect_tx((D_V / 2) * B_H * sizeof(bf16));
+        plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
+        plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
+        plan.bar_dO_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
         plan.bar_q_nope_ready.wait(0);
         plan.bar_q_rope_ready.wait(0);
         plan.bar_dO_ready.wait(0);
@@ -218,6 +219,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             plan.bar_s_tile_ready.wait(phase);
             plan.bar_ds_tile_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            if constexpr (kDebugDKVKernel) {
+                if (tid == 0 && s_q_idx == 0) {
+                    printf(
+                        "[dkv] s_tiles_ready cta=%d phase=%d k_block=%d topk_tile_idx=%d\n",
+                        cta_idx,
+                        phase,
+                        k_block,
+                        k_block * 2 + cta_idx
+                    );
+                }
+            }
         }
 
         __syncthreads();
@@ -274,6 +286,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
             plan.bar_dkv_nope_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0 && k_block == 0 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0) {
+                    printf("[dkv] transfer_nope_ready cta=%d phase=%d\n", cta_idx, phase);
+                }
+            }
 
             constexpr int COLS_PER_HALF = D_V / 2;
             constexpr int CHUNK_SIZE = 32;
@@ -302,6 +319,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             }
             plan.bar_dkv_rope_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            if constexpr (kDebugDKVKernel) {
+                if (s_q_idx == 0 && k_block == 0 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0) {
+                    printf("[dkv] transfer_rope_ready cta=%d phase=%d\n", cta_idx, phase);
+                }
+            }
             constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
             float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
             ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_base + tmem_cols::dKV_RoPE, dkv_rope_data);
@@ -335,7 +357,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 }
 
 static void launch_dkv_phase(const SparseAttnBwdParams& params) {
+    if constexpr (kDebugDKVHost) {
+        fprintf(
+            stderr,
+            "[dkv host] start s_q=%d topk=%d stride_q_h=%d stride_dO_h=%d stride_s_h=%d stride_ds_h=%d\n",
+            params.s_q,
+            params.topk,
+            params.stride_q_h_q,
+            params.stride_dO_h_q,
+            params.stride_s_h_q,
+            params.stride_ds_h_q
+        );
+        fflush(stderr);
+    }
+
     auto shape_Q = cute::make_shape(D_V, B_H, params.s_q);
+    if constexpr (kDebugDKVHost) {
+        fprintf(stderr, "[dkv host] build tma_Q\n");
+        fflush(stderr);
+    }
     auto tma_Q = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
@@ -349,6 +389,10 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
     );
 
     auto shape_Q_rope = cute::make_shape(D_ROPE, B_H, params.s_q);
+    if constexpr (kDebugDKVHost) {
+        fprintf(stderr, "[dkv host] build tma_Q_rope\n");
+        fflush(stderr);
+    }
     auto tma_Q_rope = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
@@ -362,6 +406,10 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
     );
 
     auto shape_dO = cute::make_shape(D_V, B_H, params.s_q);
+    if constexpr (kDebugDKVHost) {
+        fprintf(stderr, "[dkv host] build tma_dO\n");
+        fflush(stderr);
+    }
     auto tma_dO = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
@@ -375,6 +423,10 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
     );
 
     auto shape_S = cute::make_shape(params.topk, B_H, params.s_q);
+    if constexpr (kDebugDKVHost) {
+        fprintf(stderr, "[dkv host] build tma_S\n");
+        fflush(stderr);
+    }
     auto tma_S = cute::make_tma_copy(
         cute::SM90_TMA_LOAD{},
         cute::make_tensor(
@@ -388,6 +440,10 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
     );
 
     auto shape_dS = cute::make_shape(params.topk, B_H, params.s_q);
+    if constexpr (kDebugDKVHost) {
+        fprintf(stderr, "[dkv host] build tma_dS\n");
+        fflush(stderr);
+    }
     auto tma_dS = cute::make_tma_copy(
         cute::SM90_TMA_LOAD{},
         cute::make_tensor(
@@ -437,6 +493,10 @@ static void launch_dkv_phase(const SparseAttnBwdParams& params) {
     config.attrs = attrs;
     config.numAttrs = 1;
 
+    if constexpr (kDebugDKVHost) {
+        fprintf(stderr, "[dkv host] launch kernel grid_x=%u block_x=%u smem=%zu\n", grid.x, block.x, size_t(SMEM_SIZE));
+        fflush(stderr);
+    }
     KU_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params, tma_params));
 }
 
