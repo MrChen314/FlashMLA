@@ -249,7 +249,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "pair=%d cta=%d after main cluster_sync", k_pair, cta_idx);
 
         if (warp_role == WarpRole::DkvTransfer && warp_idx < kDkvTransferFirstWarp + kNumActiveDkvTransferWarps) {
-            const int tmem_lane_128 = (warp_idx - kDkvTransferFirstWarp) * kThreadsPerWarp + lane_idx;
+            // TMEM ld row/half mapping follows the physical 4-warp lane ordering, not
+            // the logical dKV-transfer role ordering. Keep this aligned with baseline.
+            const int tmem_lane_128 = (warp_idx & 0x3) * kThreadsPerWarp + lane_idx;
             const int row = tmem_lane_128 % DKV_ROWS_PER_CTA;
             const int half = (tmem_lane_128 / DKV_ROWS_PER_CTA) & 1;
             const int row_global = (2 * k_pair + cta_idx) * DKV_ROWS_PER_CTA + row;
