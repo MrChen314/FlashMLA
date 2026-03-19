@@ -36,28 +36,40 @@ void atomic_add_32floats_unrolled(float* dst, const float* src) {
 }
 
 enum class WarpRole {
-    Control = 0x1,
-    Transfer = 0x2,
-    Mma = 0x3,
+    SoftmaxAndDQTransfer = 0x1,
+    KvTileTransfer = 0x2,
+    DkvTransfer = 0x3,
+    Mma = 0x4,
+    KvValidLoad = 0x5,
 };
 
-static constexpr int kNumControlWarps = 1;
-static constexpr int kNumTransferWarps = 4;
+static constexpr int kNumSoftmaxAndDQTransferWarps = 4;
+static constexpr int kNumKvTileTransferWarps = 2;
+static constexpr int kNumDkvTransferWarps = 8;
 static constexpr int kNumMmaWarps = 1;
+static constexpr int kNumKvValidLoadWarps = 1;
 static constexpr int kThreadsPerWarp = 32;
-static constexpr int kControlFirstWarp = 0;
-static constexpr int kTransferFirstWarp = kControlFirstWarp + kNumControlWarps;
-static constexpr int kMmaFirstWarp = kTransferFirstWarp + kNumTransferWarps;
-static constexpr int kNumAssignedWarps = kNumControlWarps + kNumTransferWarps + kNumMmaWarps;
+static constexpr int kSoftmaxAndDQTransferFirstWarp = 0;
+static constexpr int kKvTileTransferFirstWarp = kSoftmaxAndDQTransferFirstWarp + kNumSoftmaxAndDQTransferWarps;
+static constexpr int kDkvTransferFirstWarp = kKvTileTransferFirstWarp + kNumKvTileTransferWarps;
+static constexpr int kMmaFirstWarp = kDkvTransferFirstWarp + kNumDkvTransferWarps;
+static constexpr int kKvValidLoadFirstWarp = kMmaFirstWarp + kNumMmaWarps;
+static constexpr int kNumAssignedWarps =
+    kNumSoftmaxAndDQTransferWarps + kNumKvTileTransferWarps + kNumDkvTransferWarps +
+    kNumMmaWarps + kNumKvValidLoadWarps;
+static constexpr int kNumActiveDkvTransferWarps = 4;
+static constexpr int kControlWarp = 0;
+static constexpr unsigned long long kWarpAssignment = 0x5433'3333'3322'1111ull;
 static constexpr uint16_t kClusterMask2Cta = 0x3;
 
-static_assert(kNumAssignedWarps == 6, "dKV kernel uses exactly six warps per CTA.");
+static_assert(kNumAssignedWarps == 16, "Warp assignment must cover exactly 16 warps.");
+static_assert(kKvValidLoadFirstWarp + kNumKvValidLoadWarps == kNumAssignedWarps, "Warp role ranges must be contiguous.");
+static_assert(kNumActiveDkvTransferWarps <= kNumDkvTransferWarps, "Active dKV transfer warps must fit inside the baseline layout.");
 static_assert(NUM_THREADS == kNumAssignedWarps * kThreadsPerWarp, "NUM_THREADS must match dKV warp assignment.");
 
 CUTE_DEVICE
 WarpRole warp_idx_to_role(int warp_idx) {
-    return warp_idx < kTransferFirstWarp ? WarpRole::Control :
-        (warp_idx < kMmaFirstWarp ? WarpRole::Transfer : WarpRole::Mma);
+    return static_cast<WarpRole>((kWarpAssignment >> (4 * warp_idx)) & 0xF);
 }
 
 template<typename TmaParamsType>
@@ -93,7 +105,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_dS.get_tma_descriptor());
     }
 
-    if (warp_idx == kControlFirstWarp && elect_one_sync()) {
+    if (warp_idx == kControlWarp && elect_one_sync()) {
         plan.bar_q_nope_ready.init(1);
         plan.bar_q_rope_ready.init(1);
         plan.bar_dO_ready.init(1);
@@ -112,7 +124,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
     Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
 
-    if (warp_idx == kControlFirstWarp) {
+    if (warp_idx == kControlWarp) {
         if (elect_one_sync()) {
             Tensor gQNoPE = tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, cta_idx, s_q_idx);
             ku::launch_tma_copy(
@@ -168,7 +180,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
 
-    if (warp_idx == kControlFirstWarp && elect_one_sync()) {
+    if (warp_idx == kControlWarp && elect_one_sync()) {
         plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * NOPE_COLS_PER_CTA * sizeof(bf16));
         plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * ROPE_COLS_PER_CTA * sizeof(bf16));
         plan.bar_dO_ready.arrive_and_expect_tx(B_H * NOPE_COLS_PER_CTA * sizeof(bf16));
@@ -185,8 +197,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
     cluster_sync();
 
-    if (warp_role == WarpRole::Transfer) {
-        const int tmem_lane_128 = (warp_idx - kTransferFirstWarp) * kThreadsPerWarp + lane_idx;
+    if (warp_role == WarpRole::DkvTransfer && warp_idx < kDkvTransferFirstWarp + kNumActiveDkvTransferWarps) {
+        const int tmem_lane_128 = (warp_idx - kDkvTransferFirstWarp) * kThreadsPerWarp + lane_idx;
         const int row = tmem_lane_128 % DKV_ROWS_PER_CTA;
         const int half = (tmem_lane_128 / DKV_ROWS_PER_CTA) & 1;
         const int row_global = cta_idx * DKV_ROWS_PER_CTA + row;
@@ -261,20 +273,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS_MMA{});
         Tensor sdO_mma_full = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO_MMA{});
         Tensor sQNoPE_mma_full = make_tensor(make_smem_ptr(plan.q_nope.data()), SmemLayoutQNoPE_MMA{});
-        Tensor sQRoPE_mma = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
-
-        Tensor sdO_mma_div = flat_divide(sdO_mma_full, Tile<Int<NOPE_COLS_PER_CTA>, _64>{})(_, _, _0{}, _);
-        Tensor sQNoPE_mma_div = flat_divide(sQNoPE_mma_full, Tile<Int<NOPE_COLS_PER_CTA>, _64>{})(_, _, _0{}, _);
+        Tensor sQRoPE_mma_full = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
 
         if (cta_idx == 0 && elect_one_sync()) {
-            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_div(_, _, _0{}), tdKV, true);
-            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_div(_, _, _0{}), tdKV, false);
-            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_div(_, _, _1{}), tdKV, false);
-            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_div(_, _, _1{}), tdKV, false);
+            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
+            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
             ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
             ku::tcgen05_after_thread_sync();
 
-            ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma, tdKV_RoPE, true);
+            ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
             ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, kClusterMask2Cta);
             ku::tcgen05_after_thread_sync();
         }
@@ -282,7 +289,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
     cluster_sync();
 
-    if (warp_idx == kControlFirstWarp && elect_one_sync()) {
+    if (warp_idx == kControlWarp && elect_one_sync()) {
         TMEM::Allocator2Sm().free(tmem_base, 512);
     }
 #endif
