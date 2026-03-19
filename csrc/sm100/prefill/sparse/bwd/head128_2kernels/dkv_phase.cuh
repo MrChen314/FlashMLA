@@ -179,21 +179,23 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 plan.bar_dO_ready,
                 TMA::CacheHintSm90::EVICT_FIRST
             );
-
-            TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
-            KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
-            TMEM::Allocator2Sm().release_allocation_lock();
-            DKV_DEBUG_PRINT(blockIdx.x < 2, "prologue launch done cta=%d tmem_base=%u", cta_idx, plan.tmem_start_addr.data()[0]);
+            DKV_DEBUG_PRINT(blockIdx.x < 2, "prologue tma launch done cta=%d", cta_idx);
         }
+
+        DKV_DEBUG_PRINT(blockIdx.x < 2 && lane_idx == 0, "prologue allocate begin cta=%d warp=%d", cta_idx, warp_idx);
+        TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
+        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+        TMEM::Allocator2Sm().release_allocation_lock();
+        DKV_DEBUG_PRINT(blockIdx.x < 2 && lane_idx == 0, "prologue allocate done cta=%d warp=%d tmem_base=%u", cta_idx, warp_idx, plan.tmem_start_addr.data()[0]);
     }
     __syncthreads();
 
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
 
     if (warp_idx == kControlWarp && elect_one_sync()) {
-        plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * NOPE_COLS_PER_CTA * sizeof(bf16));
-        plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * ROPE_COLS_PER_CTA * sizeof(bf16));
-        plan.bar_dO_ready.arrive_and_expect_tx(B_H * NOPE_COLS_PER_CTA * sizeof(bf16));
+        plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
+        plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
+        plan.bar_dO_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
 
         plan.bar_q_nope_ready.wait(0);
         plan.bar_q_rope_ready.wait(0);
@@ -230,8 +232,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 TMA::CacheHintSm90::EVICT_FIRST
             );
 
-            plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_ROWS_PER_CTA * sizeof(bf16));
-            plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_ROWS_PER_CTA * sizeof(bf16));
+            plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+            plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
             plan.bar_s_ready.wait(phase);
             plan.bar_ds_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
