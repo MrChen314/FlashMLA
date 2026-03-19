@@ -2,6 +2,7 @@
 
 #include "dkv_config.h"
 
+#include <cstdio>
 #include <cstring>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/arch.h>
@@ -72,6 +73,21 @@ WarpRole warp_idx_to_role(int warp_idx) {
     return static_cast<WarpRole>((kWarpAssignment >> (4 * warp_idx)) & 0xF);
 }
 
+#ifndef FLASHMLA_DKV_DEBUG
+#define FLASHMLA_DKV_DEBUG 1
+#endif
+
+#if FLASHMLA_DKV_DEBUG
+#define DKV_DEBUG_PRINT(pred, fmt, ...) \
+    do { \
+        if (pred) { \
+            printf("[dkv dbg] " fmt "\n", ##__VA_ARGS__); \
+        } \
+    } while (0)
+#else
+#define DKV_DEBUG_PRINT(pred, fmt, ...) do {} while (0)
+#endif
+
 template<typename TmaParamsType>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     __grid_constant__ const SparseAttnBwdParams params,
@@ -98,6 +114,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     const int num_k_pairs = max(params.topk / DKV_TILE_M, 1);
     const int* gIndices_s = params.indices + (int64_t)s_q_idx * params.stride_indices_s_q;
 
+    DKV_DEBUG_PRINT(
+        blockIdx.x < 2 && tid == 0,
+        "enter block=%d cta=%d s_q=%d topk=%d topk_length=%d num_k_pairs=%d",
+        (int)blockIdx.x, cta_idx, s_q_idx, params.topk, topk_length, num_k_pairs
+    );
+
     if (tid == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
@@ -117,7 +139,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         fence_barrier_init();
     }
 
+    DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "before init cluster_sync block=%d cta=%d", (int)blockIdx.x, cta_idx);
+
     cluster_sync();
+
+    DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "after init cluster_sync block=%d cta=%d", (int)blockIdx.x, cta_idx);
 
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.q_nope.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE{});
@@ -157,6 +183,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
             KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
             TMEM::Allocator2Sm().release_allocation_lock();
+            DKV_DEBUG_PRINT(blockIdx.x < 2, "prologue launch done cta=%d tmem_base=%u", cta_idx, plan.tmem_start_addr.data()[0]);
         }
     }
     __syncthreads();
@@ -172,15 +199,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         plan.bar_q_rope_ready.wait(0);
         plan.bar_dO_ready.wait(0);
         ku::tcgen05_after_thread_sync();
+        DKV_DEBUG_PRINT(blockIdx.x < 2, "prologue wait done cta=%d tmem_base=%u", cta_idx, tmem_base);
     }
 
+    DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "before prologue cluster_sync block=%d cta=%d", (int)blockIdx.x, cta_idx);
     cluster_sync();
+    DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "after prologue cluster_sync block=%d cta=%d", (int)blockIdx.x, cta_idx);
 
     CUTE_NO_UNROLL
     for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
         const int phase = k_pair & 1;
 
         if (warp_idx == kControlWarp && elect_one_sync()) {
+            DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d launch S/dS begin phase=%d", k_pair, cta_idx, phase);
             Tensor gS = tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, cta_idx, k_pair, s_q_idx);
             ku::launch_tma_copy(
                 tma_params.tma_S,
@@ -204,9 +235,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             plan.bar_s_ready.wait(phase);
             plan.bar_ds_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d launch S/dS done phase=%d", k_pair, cta_idx, phase);
         }
 
+        DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "pair=%d cta=%d before main cluster_sync", k_pair, cta_idx);
         cluster_sync();
+        DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "pair=%d cta=%d after main cluster_sync", k_pair, cta_idx);
 
         if (warp_role == WarpRole::DkvTransfer && warp_idx < kDkvTransferFirstWarp + kNumActiveDkvTransferWarps) {
             const int tmem_lane_128 = (warp_idx - kDkvTransferFirstWarp) * kThreadsPerWarp + lane_idx;
@@ -224,8 +258,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             static_assert(CHUNK_SIZE == 32);
             static_assert(ROPE_COLS_PER_HALF == 32);
 
+            DKV_DEBUG_PRINT(blockIdx.x < 2 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0,
+                "pair=%d cta=%d transfer wait nope row_global=%d", k_pair, cta_idx, row_global);
             plan.bar_dkv_nope_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            DKV_DEBUG_PRINT(blockIdx.x < 2 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0,
+                "pair=%d cta=%d transfer got nope row_global=%d valid=%d kv=%d",
+                k_pair, cta_idx, row_global, (int)row_valid, kv_idx);
 
             CUTE_UNROLL
             for (int chunk = 0; chunk < 4; ++chunk) {
@@ -255,8 +294,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 }
             }
 
+            DKV_DEBUG_PRINT(blockIdx.x < 2 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0,
+                "pair=%d cta=%d transfer wait rope row_global=%d", k_pair, cta_idx, row_global);
             plan.bar_dkv_rope_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            DKV_DEBUG_PRINT(blockIdx.x < 2 && warp_idx == kDkvTransferFirstWarp && lane_idx == 0,
+                "pair=%d cta=%d transfer got rope row_global=%d", k_pair, cta_idx, row_global);
 
             float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
             ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
@@ -285,21 +328,28 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             Tensor sQRoPE_mma_full = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
 
             if (cta_idx == 0 && elect_one_sync()) {
+                DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d mma nope begin", k_pair, cta_idx);
                 ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
                 ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
+                DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d mma nope done", k_pair, cta_idx);
 
+                DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d mma rope begin", k_pair, cta_idx);
                 ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
+                DKV_DEBUG_PRINT(blockIdx.x < 2, "pair=%d cta=%d mma rope done", k_pair, cta_idx);
             }
         }
 
+        DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "pair=%d cta=%d before tail cluster_sync", k_pair, cta_idx);
         cluster_sync();
+        DKV_DEBUG_PRINT(blockIdx.x < 2 && tid == 0, "pair=%d cta=%d after tail cluster_sync", k_pair, cta_idx);
     }
 
     if (warp_idx == kControlWarp && elect_one_sync()) {
+        DKV_DEBUG_PRINT(blockIdx.x < 2, "free tmem cta=%d base=%u", cta_idx, tmem_base);
         TMEM::Allocator2Sm().free(tmem_base, 512);
     }
 #endif
