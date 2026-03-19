@@ -70,45 +70,39 @@ static_assert(D_dK_tQ0 + D_dK_tQ1 + D_dK_sQ == D_Q);
 // - global M = 128, each CTA owns M/2 = 64 output rows
 // - global K = 128 and must stay complete for every CTA-local operand
 // - global N is split across CTA-local B operands and reassembled by cta_group::2
+// We keep the 2CTA MMA path, but stage operands in baseline-style MN-major
+// layouts first to prioritize correctness over layout tuning.
 template<int N_GLOBAL>
-using SmemLayoutOperandBTiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<N_GLOBAL / 2>, Int<B_H>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
+using SmemLayoutOperandBTiles = decltype(ku::make_umma_canonical_mn_major_layout<N_GLOBAL / 2, B_H, 128>());
 
 template<int M_GLOBAL>
-using SmemLayoutOperandATiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_INTER_Atom<bf16>{},
-    Shape<Int<M_GLOBAL / 2>, Int<B_H>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
+using SmemLayoutOperandATiles = decltype(ku::make_umma_canonical_mn_major_layout<M_GLOBAL / 2, B_H, 0>());
 
-// Q is staged for dK as B[K, N].
-// The NoPE part keeps one CTA-local half [128, 256], and RoPE keeps [128, 32].
+// Q / dO are consumed by dKV as CTA-local B operands in MN-major.
+// The NoPE part keeps one CTA-local half [256, 128], and RoPE keeps [32, 128].
 using SmemLayoutQ = SmemLayoutOperandBTiles<D_V>;
 using SmemLayoutQRoPE = SmemLayoutOperandBTiles<D_ROPE>;
 using SmemLayoutQ_tQ0 = SmemLayoutOperandBTiles<D_dK_tQ0>;
 using SmemLayoutQ_tQ1 = SmemLayoutOperandBTiles<D_dK_tQ1>;
 using SmemLayoutQ_sQ = SmemLayoutOperandBTiles<D_dK_sQ>;
 
-// dO is staged for dV as B[K, N] = dO[128, 512], so each CTA keeps [128, 256] in GEMM-B view.
+// dO is staged in the same CTA-local MN-major view as Q.
 using SmemLayoutdO = SmemLayoutOperandBTiles<D_V>;
 using SmemLayoutdOChunk = SmemLayoutOperandBTiles<D_dV_CHUNK>;
 
-// S / dS are staged directly in the A[M, K] view for 2CTA dKV MMA.
+// S / dS are staged directly in the CTA-local MN-major A[M, K] view.
 using SmemLayoutS = SmemLayoutOperandATiles<B_TOPK>;
 using SmemLayoutdS = SmemLayoutS;
 using SmemLayoutdSTransposed = SmemLayoutS;
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::K, UMMA::Major::K>{},
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::MN, UMMA::Major::MN>{},
     Layout<Shape<_1, _1, _1>>{},
     Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}
 ));
 
 using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
 ));
 
 struct tmem_cols {
