@@ -261,6 +261,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             }
             const bool row_valid = kv_idx >= 0 && kv_idx < params.s_kv && kv_idx <= max_kv_i;
             constexpr int COLS_PER_HALF = NOPE_COLS_PER_CTA / 2;
+            constexpr int NOPE_COLS_PER_CLUSTER_HALF = NOPE_COLS_PER_CTA;
             constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
             constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
             static_assert(CHUNK_SIZE == 32);
@@ -282,8 +283,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 ku::tcgen05_before_thread_sync();
 
                 if (row_valid) {
+                    // TiledMMA_dKV uses the same 2CTA permutation as forward TiledMMA_O:
+                    // TMEM [0:128]   -> global [0:128]
+                    // TMEM [128:256] -> global [256:384]
                     float* dst = params.dKV + (int64_t)kv_idx * params.stride_dKV_s_kv +
-                        half * COLS_PER_HALF + chunk * CHUNK_SIZE;
+                        half * NOPE_COLS_PER_CLUSTER_HALF + chunk * CHUNK_SIZE;
                     atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
                 }
             }
@@ -296,8 +300,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 ku::tcgen05_before_thread_sync();
 
                 if (row_valid) {
+                    // TMEM [256:384] -> global [128:256]
+                    // TMEM [384:512] -> global [384:512]
                     float* dst = params.dKV + (int64_t)kv_idx * params.stride_dKV_s_kv +
-                        256 + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
+                        COLS_PER_HALF + half * NOPE_COLS_PER_CLUSTER_HALF + chunk * CHUNK_SIZE;
                     atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
                 }
             }
