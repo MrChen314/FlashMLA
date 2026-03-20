@@ -215,10 +215,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 if (dbg_producer) {
                     printf("[DBG][DKV][SQ%d CTA%d PROD] done final bar_dkv_final_done\n", s_q_idx, cta_idx);
                 }
-                if (dbg_producer) {
-                    printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
-                }
-                TMEM::Allocator2Sm().free(tmem_base, 512);
             }
         } else if (local_warp_idx == kMmaWarp) {
             TiledMMA_dKV tiled_mma_dKV{};
@@ -395,6 +391,24 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                            s_q_idx, cta_idx, warpgroup_idx, k_pair);
                 }
             }
+        }
+    }
+
+    if (dbg_producer) {
+        printf("[DBG][DKV][SQ%d CTA%d PROD] before epilogue __syncthreads\n", s_q_idx, cta_idx);
+    }
+    __syncthreads();
+    if (dbg_producer) {
+        printf("[DBG][DKV][SQ%d CTA%d PROD] after epilogue __syncthreads\n", s_q_idx, cta_idx);
+    }
+
+    if (warp_idx == 0) {
+        if (dbg_producer) {
+            printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
+        }
+        TMEM::Allocator2Sm().free(tmem_base, 512);
+        if (dbg_producer) {
+            printf("[DBG][DKV][SQ%d CTA%d PROD] done free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
         }
     }
 #endif
