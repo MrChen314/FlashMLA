@@ -86,6 +86,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     if (warp_idx == 0 && elect_one_sync()) {
         plan.bar_prologue_q_nope.init(1);
         plan.bar_prologue_q_rope.init(1);
+        plan.bar_prologue_utccp.init(1);
         plan.bar_prologue_kv.init(1);
         plan.bar_prologue_dO.init(1);
         plan.bar_p_ready.init(1);
@@ -102,10 +103,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
     cluster_sync();
 
-    Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.q_nope.data()), SmemLayoutQNoPE{});
-    Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.q_rope.data()), SmemLayoutQRoPE{});
-    Tensor sKNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKNoPE{});
-    Tensor sKRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPE{});
+    Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQNoPE{});
+    Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_V), SmemLayoutQRoPE{});
+    Tensor sQ = make_tensor(make_smem_ptr(plan.u.q_kv.sq.data()), SmemLayoutQTiles<NUM_sQ_TILES>{});
+    Tensor sK_sQ = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKVTiles<NUM_sQ_TILES>{});
+    Tensor sK_tQ = make_tensor(
+        make_smem_ptr(plan.u.q_kv.k_nope.data() + (B_TOPK / 2) * D_sQ),
+        SmemLayoutKVTiles<NUM_tQ_TILES>{}
+    );
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
 
     if (warp_idx == 0) {
@@ -374,6 +379,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         static_assert((B_TOPK / 2) % (4 * NUM_WARPS) == 0);
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
 
+        if (elect_one_sync()) {
+            plan.bar_prologue_utccp.wait(0);
+        }
+
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
@@ -421,6 +430,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int NUM_DQ_ROWS_PER_WARP = B_TOPK / 4 / NUM_WARPS;
         bf16* sKPeerNoPE_base = plan.u.q_kv.kv_peer.data();
         bf16* sKPeerRoPE_base = plan.u.q_kv.kv_peer.data() + cosize_v<SmemLayoutKPeerNoPE>;
+
+        if (elect_one_sync()) {
+            plan.bar_prologue_utccp.wait(0);
+        }
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -475,17 +488,32 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
     if (warpgroup_idx == 3) {
         if (local_warp_idx == kWg3MmaWarp) {
-            TiledMMA_P tiled_mma_P{};
+            TiledMMA_P_tQ tiled_mma_P_tQ{};
+            TiledMMA_P_sQ tiled_mma_P_sQ{};
             TiledMMA_dP tiled_mma_dP{};
-            Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H / 2>, Int<B_TOPK>>{});
+            Tensor tP = partition_fragment_C(tiled_mma_P_tQ, Shape<Int<B_H / 2>, Int<B_TOPK>>{});
+            Tensor tQ = tiled_mma_P_tQ.get_slice(_0{}).make_fragment_A(
+                partition_shape_A(tiled_mma_P_tQ, Shape<Int<B_H / 2>, Int<D_tQ>>{})
+            );
             Tensor tdP = partition_fragment_C(tiled_mma_dP, Shape<Int<B_H / 2>, Int<B_TOPK>>{});
             tP.data().get() = tmem_cols::P;
+            tQ.data().get() = tmem_cols::q;
             tdP.data().get() = tmem_cols::dP;
 
             Tensor sV = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutV{});
 
             if (elect_one_sync()) {
                 if (cta_idx == 0) {
+                    UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                        make_tensor(
+                            make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_sQ),
+                            tile_to_shape(
+                                UMMA::Layout_K_SW128_Atom<bf16>{},
+                                Shape<Int<B_H / 2>, Int<64>>{}
+                            )
+                        )
+                    );
+
                     plan.bar_prologue_q_nope.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
                     plan.bar_prologue_q_rope.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
                     plan.bar_prologue_dO.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
@@ -493,6 +521,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     plan.bar_prologue_q_rope.wait(0);
                     plan.bar_prologue_dO.wait(0);
                     ku::tcgen05_after_thread_sync();
+
+                    CUTE_UNROLL
+                    for (int tile_idx = 0; tile_idx < NUM_tQ_TILES; ++tile_idx) {
+                        CUTE_UNROLL
+                        for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
+                            SM100_UTCCP_2x64dp128bitlw0213_2cta::copy(
+                                sQ_desc + tile_idx * ((B_H / 2) * 128 / 16) + subtile_idx * (16 / 16),
+                                tmem_cols::q + tile_idx * 32 + subtile_idx * 4
+                            );
+                        }
+                    }
+                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_prologue_utccp, kClusterMask2Cta);
                 }
 
                 TiledMMA_dQ tiled_mma_dQ{};
@@ -518,8 +558,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         plan.bar_prologue_kv.arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
                         plan.bar_prologue_kv.wait(phase);
                         ku::tcgen05_after_thread_sync();
-                        ku::utcmma_ss(tiled_mma_P, sQNoPE, sKNoPE, tP, true);
-                        ku::utcmma_ss(tiled_mma_P, sQRoPE, sKRoPE, tP, false);
+                        ku::utcmma_ss(tiled_mma_P_sQ, sQ, sK_sQ, tP, true);
+                        ku::utcmma_ts(tiled_mma_P_tQ, tQ, sK_tQ, tP, false);
                         ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_p_ready, 1 | 2);
                         ku::tcgen05_after_thread_sync();
 

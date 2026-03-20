@@ -47,10 +47,15 @@ static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int B_H = 128;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_THREADS = 16 * 32;
+static constexpr int D_tQ = 320;
+static constexpr int NUM_tQ_TILES = D_tQ / 64;
+static constexpr int D_sQ = D_QK - D_tQ;
+static constexpr int NUM_sQ_TILES = D_sQ / 64;
 static constexpr int S_DS_VEC_ELEMS = 8;
 static constexpr int S_DS_ROWS_PER_CTA = B_H / 2;
 static constexpr int S_DS_COLS_PER_THREAD = B_TOPK / 2;
 
+static_assert(D_sQ % 64 == 0 && D_tQ % 64 == 0 && D_sQ + D_tQ == D_Q);
 static_assert(S_DS_ROWS_PER_CTA == B_TOPK, "S/dS writer mapping assumes a 64x64 softmax tile per CTA.");
 static_assert(S_DS_COLS_PER_THREAD % S_DS_VEC_ELEMS == 0, "S/dS vectorized stores require B_TOPK/2 to be a multiple of 8.");
 
@@ -136,7 +141,11 @@ using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using TiledMMA_P = decltype(make_tiled_mma(
+using TiledMMA_P_tQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
+));
+
+using TiledMMA_P_sQ = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
@@ -157,28 +166,33 @@ using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
 static_assert(cosize_v<SmemLayoutKPeerNoPE> == cosize_v<SmemLayoutKPeerNoPE_MMA>);
 static_assert(cosize_v<SmemLayoutKPeerRoPE> == cosize_v<SmemLayoutKPeerRoPE_MMA>);
 static_assert(cosize_v<SmemLayoutKV> == cosize_v<SmemLayoutKPeerNoPE> + cosize_v<SmemLayoutKPeerRoPE>);
+static_assert(cosize_v<SmemLayoutQ> == cosize_v<SmemLayoutQNoPE> + cosize_v<SmemLayoutQRoPE>);
+static_assert(cosize_v<SmemLayoutQ> <= cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>> + cosize_v<SmemLayoutKV> + cosize_v<SmemLayoutKV>);
 
 struct tmem_cols {
     static constexpr int dQ = 0;
     static constexpr int dQ_RoPE = 256;
     static constexpr int P = 288;
     static constexpr int dP = 320;
-    static constexpr int kNumUsedCols = 352;
+    static constexpr int q = 352;
+    static constexpr int kNumUsedCols = q + D_tQ / 2;
 };
 
 static_assert(tmem_cols::dQ_RoPE == tmem_cols::dQ + D_V / 2);
 static_assert(tmem_cols::P == tmem_cols::dQ_RoPE + D_ROPE / 2);
 static_assert(tmem_cols::dP == tmem_cols::P + B_TOPK / 2);
-static_assert(tmem_cols::kNumUsedCols == tmem_cols::dP + B_TOPK / 2);
+static_assert(tmem_cols::q == tmem_cols::dP + B_TOPK / 2);
+static_assert(tmem_cols::kNumUsedCols == tmem_cols::q + D_tQ / 2);
+static_assert(tmem_cols::kNumUsedCols == 512, "dq kernel should fully use the 512 logical TMEM columns after staging tq.");
 
 struct alignas(128) SharedMemoryPlan {
     union {
+        array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
         struct {
+            array_aligned<bf16, cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>>> sq;
             array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;
             array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;
             array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;
-            array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;
-            array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;
         } q_kv;
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;
     } u;
@@ -192,6 +206,7 @@ struct alignas(128) SharedMemoryPlan {
 
     transac_bar_t bar_prologue_q_nope;
     transac_bar_t bar_prologue_q_rope;
+    transac_bar_t bar_prologue_utccp;
     transac_bar_t bar_prologue_kv;
     transac_bar_t bar_prologue_dO;
     transac_bar_t bar_p_ready;
