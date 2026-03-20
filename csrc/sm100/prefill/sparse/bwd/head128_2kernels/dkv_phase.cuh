@@ -101,7 +101,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         }
         plan.bar_dkv_nope_ready.init(1);
         plan.bar_dkv_rope_ready.init(1);
-        plan.bar_dkv_free.init(kDkvTransferThreadsPerCta * 2);
+        plan.bar_dkv_free.init(kDkvTransferThreadsPerCta);
         fence_barrier_init();
     }
 
