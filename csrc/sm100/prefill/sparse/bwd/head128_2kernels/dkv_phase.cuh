@@ -2,6 +2,7 @@
 
 #include "dkv_config.h"
 
+#include <cstdio>
 #include <cstring>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/arch.h>
@@ -74,6 +75,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         min(max(__ldg(params.topk_length + s_q_idx), 0), params.topk);
     const int num_k_pairs = max(params.topk / DKV_TILE_M, 1);
     const int* gIndices_s = params.indices + (int64_t)s_q_idx * params.stride_indices_s_q;
+    const bool dbg_block = blockIdx.x < 2;
+    const bool dbg_lane = lane_idx == 0;
+    const bool dbg_producer = dbg_block && dbg_lane && warpgroup_idx == 0 && local_warp_idx == kProducerWarp;
+    const bool dbg_mma = dbg_block && dbg_lane && cta_idx == 0 && warpgroup_idx == 0 && local_warp_idx == kMmaWarp;
+    const bool dbg_drain_nope = dbg_block && dbg_lane && warpgroup_idx == 1 && local_warp_idx == 0;
+    const bool dbg_drain_rope = dbg_block && dbg_lane && warpgroup_idx == 2 && local_warp_idx == 0;
 
     if (tid == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
@@ -98,7 +105,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         fence_barrier_init();
     }
 
+    if (dbg_producer) {
+        printf("[DBG][DKV][SQ%d CTA%d PROD] before init cluster_sync topk=%d pairs=%d\n",
+               s_q_idx, cta_idx, topk_length, num_k_pairs);
+    }
     cluster_sync();
+    if (dbg_producer) {
+        printf("[DBG][DKV][SQ%d CTA%d PROD] after init cluster_sync\n", s_q_idx, cta_idx);
+    }
 
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.q_nope.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE{});
@@ -145,6 +159,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     if (warpgroup_idx == 0) {
         if (local_warp_idx == kProducerWarp) {
             if (elect_one_sync()) {
+                if (dbg_producer) {
+                    printf("[DBG][DKV][SQ%d CTA%d PROD] loop_start\n", s_q_idx, cta_idx);
+                }
                 CUTE_NO_UNROLL
                 for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
                     const int s_ds_buf = k_pair % NUM_S_DS_BUFS;
@@ -153,8 +170,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
                     if (k_pair >= NUM_S_DS_BUFS) {
                         // Reuse an S/dS slot only after the previous rope MMA on that slot has completed.
+                        if (dbg_producer) {
+                            printf("[DBG][DKV][SQ%d CTA%d PROD] k=%d wait bar_dkv_rope_ready phase=%d buf=%d\n",
+                                   s_q_idx, cta_idx, k_pair, (k_pair - NUM_S_DS_BUFS) & 1, s_ds_buf);
+                        }
                         plan.bar_dkv_rope_ready.wait((k_pair - NUM_S_DS_BUFS) & 1);
                         ku::tcgen05_after_thread_sync();
+                        if (dbg_producer) {
+                            printf("[DBG][DKV][SQ%d CTA%d PROD] k=%d done bar_dkv_rope_ready\n",
+                                   s_q_idx, cta_idx, k_pair);
+                        }
                     }
 
                     Tensor gS = tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, cta_idx, k_pair, s_q_idx);
@@ -174,11 +199,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                         plan.bar_ds_ready[s_ds_buf],
                         TMA::CacheHintSm90::EVICT_FIRST
                     );
+                    if (dbg_producer) {
+                        printf("[DBG][DKV][SQ%d CTA%d PROD] k=%d launched S/dS buf=%d\n",
+                               s_q_idx, cta_idx, k_pair, s_ds_buf);
+                    }
                 }
 
+                if (dbg_producer) {
+                    printf("[DBG][DKV][SQ%d CTA%d PROD] wait final bar_dkv_free phase=%d\n",
+                           s_q_idx, cta_idx, (num_k_pairs - 1) & 1);
+                }
                 plan.bar_dkv_free.wait((num_k_pairs - 1) & 1);
                 ku::tcgen05_after_thread_sync();
+                if (dbg_producer) {
+                    printf("[DBG][DKV][SQ%d CTA%d PROD] done final bar_dkv_free\n", s_q_idx, cta_idx);
+                }
                 if (cta_idx == 0) {
+                    if (dbg_producer) {
+                        printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
+                    }
                     TMEM::Allocator2Sm().free(tmem_base, 512);
                 }
             }
@@ -195,6 +234,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             Tensor sQRoPE_mma_full = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
 
             if (cta_idx == 0 && elect_one_sync()) {
+                if (dbg_mma) {
+                    printf("[DBG][DKV][SQ%d CTA%d MMA] wait q/dO prologue\n", s_q_idx, cta_idx);
+                }
                 plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
                 plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
                 plan.bar_dO_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
@@ -203,6 +245,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 plan.bar_q_rope_ready.wait(0);
                 plan.bar_dO_ready.wait(0);
                 ku::tcgen05_after_thread_sync();
+                if (dbg_mma) {
+                    printf("[DBG][DKV][SQ%d CTA%d MMA] done q/dO prologue\n", s_q_idx, cta_idx);
+                }
 
                 CUTE_NO_UNROLL
                 for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
@@ -214,24 +259,44 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     if (k_pair > 0) {
                         // TMEM has a single logical dKV accumulator tile, so each issue waits
                         // until both drain warpgroups finish the previous tile.
+                        if (dbg_mma) {
+                            printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d wait bar_dkv_free phase=%d\n",
+                                   s_q_idx, cta_idx, k_pair, (k_pair - 1) & 1);
+                        }
                         plan.bar_dkv_free.wait((k_pair - 1) & 1);
                         ku::tcgen05_after_thread_sync();
+                        if (dbg_mma) {
+                            printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d done bar_dkv_free\n", s_q_idx, cta_idx, k_pair);
+                        }
                     }
 
+                    if (dbg_mma) {
+                        printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d wait S/dS buf=%d phase=%d\n",
+                               s_q_idx, cta_idx, k_pair, s_ds_buf, s_ds_phase);
+                    }
                     plan.bar_s_ready[s_ds_buf].arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
                     plan.bar_ds_ready[s_ds_buf].arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
                     plan.bar_s_ready[s_ds_buf].wait(s_ds_phase);
                     plan.bar_ds_ready[s_ds_buf].wait(s_ds_phase);
                     ku::tcgen05_after_thread_sync();
+                    if (dbg_mma) {
+                        printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d done S/dS wait\n", s_q_idx, cta_idx, k_pair);
+                    }
 
                     ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
                     ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
                     ku::tcgen05_after_thread_sync();
+                    if (dbg_mma) {
+                        printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d arrived nope\n", s_q_idx, cta_idx, k_pair);
+                    }
 
                     ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, kClusterMask2Cta);
                     ku::tcgen05_after_thread_sync();
+                    if (dbg_mma) {
+                        printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d arrived rope\n", s_q_idx, cta_idx, k_pair);
+                    }
                 }
             }
         }
@@ -256,8 +321,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             }
             const bool row_valid = kv_idx >= 0 && kv_idx < params.s_kv && kv_idx <= max_kv_i;
 
+            if (dbg_drain_nope || dbg_drain_rope) {
+                printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d wait nope phase=%d row_global=%d valid=%d\n",
+                       s_q_idx, cta_idx, warpgroup_idx, k_pair, dkv_phase, row_global, (int)row_valid);
+            }
             plan.bar_dkv_nope_ready.wait(dkv_phase);
             ku::tcgen05_after_thread_sync();
+            if (dbg_drain_nope || dbg_drain_rope) {
+                printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d done nope wait\n",
+                       s_q_idx, cta_idx, warpgroup_idx, k_pair);
+            }
 
             if (warpgroup_idx == 1) {
                 CUTE_UNROLL
@@ -288,8 +361,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     }
                 }
 
+                if (dbg_drain_rope) {
+                    printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d wait rope phase=%d\n",
+                           s_q_idx, cta_idx, warpgroup_idx, k_pair, dkv_phase);
+                }
                 plan.bar_dkv_rope_ready.wait(dkv_phase);
                 ku::tcgen05_after_thread_sync();
+                if (dbg_drain_rope) {
+                    printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d done rope wait\n",
+                           s_q_idx, cta_idx, warpgroup_idx, k_pair);
+                }
 
                 float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
                 ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
@@ -304,6 +385,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             }
 
             plan.bar_dkv_free.arrive();
+            if (dbg_drain_nope || dbg_drain_rope) {
+                printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d arrived dkv_free\n",
+                       s_q_idx, cta_idx, warpgroup_idx, k_pair);
+            }
         }
     }
 #endif
