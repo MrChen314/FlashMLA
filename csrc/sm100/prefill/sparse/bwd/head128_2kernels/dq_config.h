@@ -35,6 +35,8 @@ struct TmaParams {
     Shape_dS shape_dS;
     TMA_dS tma_dS;
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_kv_nope;
+    CUtensorMap tensor_map_kv_rope;
 };
 
 static constexpr int D_QK = 576;
@@ -96,6 +98,30 @@ using SmemLayoutKVTilesTransposed = decltype(coalesce(tile_to_shape(
 using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
 using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
+using SmemLayoutKPeerNoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_TOPK>, Int<D_V / 2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutKPeerRoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<B_TOPK>, Int<D_ROPE / 2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutKPeerNoPE_MMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_SW128_Atom<bf16>{},
+    Shape<Int<D_V / 2>, Int<B_TOPK>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutKPeerRoPE_MMA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_SW64_Atom<bf16>{},
+    Shape<Int<D_ROPE / 2>, Int<B_TOPK>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_INTER_Atom<bf16>{},
     Shape<Int<B_H / 2>, Int<B_TOPK>>{},
@@ -119,12 +145,18 @@ using TiledMMA_dP = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, 256, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{},
+    Layout<Shape<_1, _1, _1>>{},
+    Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}
 ));
 
 using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
 ));
+
+static_assert(cosize_v<SmemLayoutKPeerNoPE> == cosize_v<SmemLayoutKPeerNoPE_MMA>);
+static_assert(cosize_v<SmemLayoutKPeerRoPE> == cosize_v<SmemLayoutKPeerRoPE_MMA>);
+static_assert(cosize_v<SmemLayoutKV> == cosize_v<SmemLayoutKPeerNoPE> + cosize_v<SmemLayoutKPeerRoPE>);
 
 struct tmem_cols {
     static constexpr int dQ = 0;
@@ -168,8 +200,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_ds_ready;
     transac_bar_t bar_k_valid_free;
     transac_bar_t bar_k_valid_ready;
-    transac_bar_t bar_kv_peer_cp_async;
-    transac_bar_t bar_kv_peer_ready;
+    transac_bar_t bar_kv_peer_nope_ready;
+    transac_bar_t bar_kv_peer_rope_ready;
     transac_bar_t bar_dq_ready;
 
     array_aligned<uint32_t, 1> tmem_start_addr;
