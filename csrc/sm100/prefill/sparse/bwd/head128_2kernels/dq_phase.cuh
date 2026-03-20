@@ -428,7 +428,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         const int local_warp_idx = warp_idx - kKvTileTransferFirstWarp;
         bf16* sKPeerNoPE_base = plan.u.q_kv.kv_peer.data();
         bf16* sKPeerRoPE_base = plan.u.q_kv.kv_peer.data() + cosize_v<SmemLayoutKPeerNoPE>;
-        const bool dbg_print = (blockIdx.x < 2) && (lane_idx == 0) && (local_warp_idx == 0);
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -479,13 +478,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     CUTE_UNROLL
                     for (int local_col = 0; local_col < D_V / 64 / 2; ++local_col) {
                         bf16* peer_nope_dst = sKPeerNoPE_base + dq_row * 64 + local_col * (B_TOPK * 64);
-                        const uint32_t peer_nope_addr = cute::cast_smem_ptr_to_uint(peer_nope_dst);
-                        KU_TRAP_ONLY_DEVICE_ASSERT((peer_nope_addr & 0x7f) == 0);
-                        if (dbg_print && k_block == 0 && local_row == 0) {
-                            printf("[DBG][B%d SQ%d CTA%d KV] peer_nope row=%d col=%d smem=0x%x align=%u\n",
-                                   blockIdx.x, s_q_idx, cta_idx, dq_row, local_col * 64,
-                                   peer_nope_addr, peer_nope_addr & 0x7f);
-                        }
                         ku::tma_gather4_cta_group_2<true>(
                             &(tma_params.tensor_map_kv_nope),
                             plan.bar_kv_peer_nope_ready,
@@ -497,13 +489,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     }
 
                     bf16* peer_rope_dst = sKPeerRoPE_base + dq_row * (D_ROPE / 2);
-                    const uint32_t peer_rope_addr = cute::cast_smem_ptr_to_uint(peer_rope_dst);
-                    KU_TRAP_ONLY_DEVICE_ASSERT((peer_rope_addr & 0x3f) == 0);
-                    if (dbg_print && k_block == 0 && local_row == 0) {
-                        printf("[DBG][B%d SQ%d CTA%d KV] peer_rope row=%d col=%d smem=0x%x align=%u\n",
-                               blockIdx.x, s_q_idx, cta_idx, dq_row, cta_idx * (D_ROPE / 2),
-                               peer_rope_addr, peer_rope_addr & 0x3f);
-                    }
                     ku::tma_gather4_cta_group_2<true>(
                         &(tma_params.tensor_map_kv_rope),
                         plan.bar_kv_peer_rope_ready,
