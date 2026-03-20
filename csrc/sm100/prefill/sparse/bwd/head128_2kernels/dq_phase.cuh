@@ -378,6 +378,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
 
+            if (k_block > 0) {
+                // WG1 still reuses the same shared KV staging as dP/dQ consumers, so
+                // keep the original producer/consumer ordering across iterations.
+                plan.bar_dq_ready.wait((k_block - 1) & 1);
+            }
+
             if (elect_one_sync()) {
                 bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
                 int4 local_indices4[NUM_LOCAL_ROWS_PER_WARP];
