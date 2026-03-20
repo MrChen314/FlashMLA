@@ -214,12 +214,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 if (dbg_producer) {
                     printf("[DBG][DKV][SQ%d CTA%d PROD] done final bar_dkv_free\n", s_q_idx, cta_idx);
                 }
-                if (cta_idx == 0) {
-                    if (dbg_producer) {
-                        printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
-                    }
-                    TMEM::Allocator2Sm().free(tmem_base, 512);
+                if (dbg_producer) {
+                    printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
                 }
+                TMEM::Allocator2Sm().free(tmem_base, 512);
             }
         } else if (local_warp_idx == kMmaWarp) {
             TiledMMA_dKV tiled_mma_dKV{};
