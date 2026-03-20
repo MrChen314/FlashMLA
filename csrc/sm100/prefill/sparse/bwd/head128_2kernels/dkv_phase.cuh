@@ -36,19 +36,6 @@ void atomic_add_32floats_unrolled(float* dst, const float* src) {
         :: "l"(dst + 28), "f"(src[28]), "f"(src[29]), "f"(src[30]), "f"(src[31]) : "memory");
 }
 
-static constexpr int kThreadsPerWarp = 32;
-static constexpr int kWarpsPerWarpgroup = 4;
-static constexpr int kThreadsPerWarpgroup = kWarpsPerWarpgroup * kThreadsPerWarp;
-static constexpr int kNumWarpgroups = 3;
-static constexpr int kProducerWarp = 0;
-static constexpr int kMmaWarp = 1;
-static constexpr int kNumDkvTransferWarpgroups = 2;
-static constexpr int kNumDkvTransferWarps = kNumDkvTransferWarpgroups * kWarpsPerWarpgroup;
-static constexpr int kDkvTransferThreadsPerCta = kNumDkvTransferWarps * kThreadsPerWarp;
-static constexpr uint16_t kClusterMask2Cta = 0x3;
-
-static_assert(NUM_THREADS == kNumWarpgroups * kThreadsPerWarpgroup, "NUM_THREADS must match the dKV warpgroup layout.");
-
 template<typename TmaParamsType>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     __grid_constant__ const SparseAttnBwdParams params,
@@ -60,11 +47,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
     const int cta_idx = blockIdx.x % 2;
     const int s_q_idx = blockIdx.x / 2;
-    const int tid = threadIdx.x;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
-    const int lane_idx = tid % kThreadsPerWarp;
-    const int warpgroup_idx = __shfl_sync(0xffffffff, tid / kThreadsPerWarpgroup, 0);
-    const int local_warp_idx = warp_idx - warpgroup_idx * kWarpsPerWarpgroup;
+    const int lane_idx = threadIdx.x % 32;
+    const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
+    const int idx_in_warpgroup = threadIdx.x % 128;
     if (s_q_idx >= params.s_q) {
         return;
     }
@@ -77,12 +63,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     const int* gIndices_s = params.indices + (int64_t)s_q_idx * params.stride_indices_s_q;
     const bool dbg_block = blockIdx.x < 2;
     const bool dbg_lane = lane_idx == 0;
-    const bool dbg_producer = dbg_block && dbg_lane && warpgroup_idx == 0 && local_warp_idx == kProducerWarp;
-    const bool dbg_mma = dbg_block && dbg_lane && cta_idx == 0 && warpgroup_idx == 0 && local_warp_idx == kMmaWarp;
-    const bool dbg_drain_nope = dbg_block && dbg_lane && warpgroup_idx == 1 && local_warp_idx == 0;
-    const bool dbg_drain_rope = dbg_block && dbg_lane && warpgroup_idx == 2 && local_warp_idx == 0;
+    const bool dbg_producer = dbg_block && dbg_lane && warp_idx == 0;
+    const bool dbg_mma = dbg_block && dbg_lane && cta_idx == 0 && warp_idx == 1;
+    const bool dbg_drain_nope = dbg_block && warpgroup_idx == 1 && idx_in_warpgroup == 0;
+    const bool dbg_drain_rope = dbg_block && warpgroup_idx == 2 && idx_in_warpgroup == 0;
 
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dO.get_tma_descriptor());
@@ -101,8 +87,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         }
         plan.bar_dkv_nope_ready.init(1);
         plan.bar_dkv_rope_ready.init(1);
-        plan.bar_dkv_free.init(kDkvTransferThreadsPerCta);
-        plan.bar_dkv_final_done.init(kDkvTransferThreadsPerCta);
+        plan.bar_dkv_free.init(NUM_THREADS - 128);
+        plan.bar_dkv_final_done.init(NUM_THREADS - 128);
         fence_barrier_init();
     }
 
@@ -158,7 +144,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
 
     if (warpgroup_idx == 0) {
-        if (local_warp_idx == kProducerWarp) {
+        if (warp_idx == 0) {
             if (elect_one_sync()) {
                 if (dbg_producer) {
                     printf("[DBG][DKV][SQ%d CTA%d PROD] loop_start\n", s_q_idx, cta_idx);
@@ -216,7 +202,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     printf("[DBG][DKV][SQ%d CTA%d PROD] done final bar_dkv_final_done\n", s_q_idx, cta_idx);
                 }
             }
-        } else if (local_warp_idx == kMmaWarp) {
+        } else if (warp_idx == 1) {
             TiledMMA_dKV tiled_mma_dKV{};
             TiledMMA_dKV_RoPE tiled_mma_dKV_RoPE{};
             Tensor tdKV = partition_fragment_C(tiled_mma_dKV, Shape<Int<DKV_ROWS_PER_CTA>, Int<D_V>>{});
@@ -280,14 +266,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
                     ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
                     ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
+                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, 0x3);
                     ku::tcgen05_after_thread_sync();
                     if (dbg_mma) {
                         printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d arrived nope\n", s_q_idx, cta_idx, k_pair);
                     }
 
                     ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, kClusterMask2Cta);
+                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, 0x3);
                     ku::tcgen05_after_thread_sync();
                     if (dbg_mma) {
                         printf("[DBG][DKV][SQ%d CTA%d MMA] k=%d arrived rope\n", s_q_idx, cta_idx, k_pair);
@@ -296,9 +282,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             }
         }
     } else {
-        const int tmem_lane_128 = local_warp_idx * kThreadsPerWarp + lane_idx;
-        const int row = tmem_lane_128 % DKV_ROWS_PER_CTA;
-        const int half = (tmem_lane_128 / DKV_ROWS_PER_CTA) & 1;
+        const int row = idx_in_warpgroup % DKV_ROWS_PER_CTA;
+        const int half = (idx_in_warpgroup / DKV_ROWS_PER_CTA) & 1;
         constexpr int COLS_PER_HALF = NOPE_COLS_PER_CTA / 2;
         constexpr int NOPE_COLS_PER_CLUSTER_HALF = NOPE_COLS_PER_CTA;
         constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
