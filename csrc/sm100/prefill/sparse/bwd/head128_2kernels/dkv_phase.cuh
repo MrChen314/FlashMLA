@@ -102,6 +102,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         plan.bar_dkv_nope_ready.init(1);
         plan.bar_dkv_rope_ready.init(1);
         plan.bar_dkv_free.init(kDkvTransferThreadsPerCta);
+        plan.bar_dkv_final_done.init(kDkvTransferThreadsPerCta);
         fence_barrier_init();
     }
 
@@ -206,13 +207,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 }
 
                 if (dbg_producer) {
-                    printf("[DBG][DKV][SQ%d CTA%d PROD] wait final bar_dkv_free phase=%d\n",
-                           s_q_idx, cta_idx, (num_k_pairs - 1) & 1);
+                    printf("[DBG][DKV][SQ%d CTA%d PROD] wait final bar_dkv_final_done\n",
+                           s_q_idx, cta_idx);
                 }
-                plan.bar_dkv_free.wait((num_k_pairs - 1) & 1);
+                plan.bar_dkv_final_done.wait(0);
                 ku::tcgen05_after_thread_sync();
                 if (dbg_producer) {
-                    printf("[DBG][DKV][SQ%d CTA%d PROD] done final bar_dkv_free\n", s_q_idx, cta_idx);
+                    printf("[DBG][DKV][SQ%d CTA%d PROD] done final bar_dkv_final_done\n", s_q_idx, cta_idx);
                 }
                 if (dbg_producer) {
                     printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
@@ -386,6 +387,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             if (dbg_drain_nope || dbg_drain_rope) {
                 printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d arrived dkv_free\n",
                        s_q_idx, cta_idx, warpgroup_idx, k_pair);
+            }
+            if (k_pair == num_k_pairs - 1) {
+                plan.bar_dkv_final_done.arrive();
+                if (dbg_drain_nope || dbg_drain_rope) {
+                    printf("[DBG][DKV][SQ%d CTA%d DRN%d] k=%d arrived dkv_final_done\n",
+                           s_q_idx, cta_idx, warpgroup_idx, k_pair);
+                }
             }
         }
     }

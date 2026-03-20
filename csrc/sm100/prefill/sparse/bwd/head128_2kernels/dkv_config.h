@@ -138,6 +138,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dkv_rope_ready;
     // Guards TMEM reuse across successive dKV tiles after both drain warpgroups finish.
     transac_bar_t bar_dkv_free;
+    // One-shot completion barrier for the final drain, used before TMEM free.
+    transac_bar_t bar_dkv_final_done;
 
     array_aligned<uint32_t, 1> tmem_start_addr;
 };
