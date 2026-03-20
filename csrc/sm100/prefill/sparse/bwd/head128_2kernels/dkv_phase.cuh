@@ -402,6 +402,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         printf("[DBG][DKV][SQ%d CTA%d PROD] after epilogue __syncthreads\n", s_q_idx, cta_idx);
     }
 
+    if (dbg_producer) {
+        printf("[DBG][DKV][SQ%d CTA%d PROD] before final cluster_sync\n", s_q_idx, cta_idx);
+    }
+    cluster_sync();
+    if (dbg_producer) {
+        printf("[DBG][DKV][SQ%d CTA%d PROD] after final cluster_sync\n", s_q_idx, cta_idx);
+    }
+
     if (warp_idx == 0) {
         if (dbg_producer) {
             printf("[DBG][DKV][SQ%d CTA%d PROD] free TMEM base=%u\n", s_q_idx, cta_idx, tmem_base);
