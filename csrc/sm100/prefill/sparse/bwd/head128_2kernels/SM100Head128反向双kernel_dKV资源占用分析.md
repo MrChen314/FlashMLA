@@ -192,9 +192,9 @@ struct alignas(128) SharedMemoryPlan {
 
 如果和同目录下当前的 `dQ kernel` 文档对比：
 
-- `dQ kernel` SMEM: `229,504 B`（224.12 KiB）
+- `dQ kernel` SMEM: `225,536 B`（220.25 KiB）
 - `dKV kernel` SMEM: `155,776 B`（152.12 KiB）
-- **差值**: `73,728 B`（72.00 KiB）
+- **差值**: `69,760 B`（68.12 KiB）
 
 这部分收益主要来自：
 

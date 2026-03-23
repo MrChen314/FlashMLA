@@ -47,6 +47,7 @@ static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int B_H = 128;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_THREADS = 16 * 32;
+static constexpr int NUM_KV_BUFS = 2;
 static constexpr int D_tQ = 320;
 static constexpr int NUM_tQ_TILES = D_tQ / 64;
 static constexpr int D_sQ = D_QK - D_tQ;
@@ -56,6 +57,7 @@ static constexpr int S_DS_ROWS_PER_CTA = B_H / 2;
 static constexpr int S_DS_COLS_PER_THREAD = B_TOPK / 2;
 
 static_assert(D_sQ % 64 == 0 && D_tQ % 64 == 0 && D_sQ + D_tQ == D_Q);
+static_assert(NUM_KV_BUFS == 2, "dq kernel currently expects ping-pong shared-memory buffering for local KV tiles.");
 static_assert(S_DS_ROWS_PER_CTA == B_TOPK, "S/dS writer mapping assumes a 64x64 softmax tile per CTA.");
 static_assert(S_DS_COLS_PER_THREAD % S_DS_VEC_ELEMS == 0, "S/dS vectorized stores require B_TOPK/2 to be a multiple of 8.");
 
@@ -190,8 +192,7 @@ struct alignas(128) SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
         struct {
             array_aligned<bf16, cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>>> sq;
-            array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;
-            array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;
+            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv[NUM_KV_BUFS];
             array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;
         } q_kv;
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;

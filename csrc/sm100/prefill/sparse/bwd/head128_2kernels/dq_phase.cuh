@@ -106,11 +106,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_V), SmemLayoutQRoPE{});
     Tensor sQ = make_tensor(make_smem_ptr(plan.u.q_kv.sq.data()), SmemLayoutQTiles<NUM_sQ_TILES>{});
-    Tensor sK_sQ = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKVTiles<NUM_sQ_TILES>{});
-    Tensor sK_tQ = make_tensor(
-        make_smem_ptr(plan.u.q_kv.k_nope.data() + (B_TOPK / 2) * D_sQ),
-        SmemLayoutKVTiles<NUM_tQ_TILES>{}
-    );
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
 
     if (warp_idx == 0) {
@@ -387,14 +382,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
 
-            if (k_block > 0) {
-                // WG1 still reuses the same shared KV staging as dP/dQ consumers, so
-                // keep the original producer/consumer ordering across iterations.
-                plan.bar_dq_ready.wait((k_block - 1) & 1);
+            if (k_block >= NUM_KV_BUFS) {
+                // Reuse the ping-pong KV buffer only after the same-phase dQ consumers
+                // have finished the previous round that touched it.
+                plan.bar_dq_ready.wait(phase);
             }
 
             if (elect_one_sync()) {
-                bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
+                bf16* sKV_base = plan.u.q_kv.kv[phase].data() + local_warp_idx * 4 * 64;
                 int4 local_indices4[NUM_LOCAL_ROWS_PER_WARP];
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -500,8 +495,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             tQ.data().get() = tmem_cols::q;
             tdP.data().get() = tmem_cols::dP;
 
-            Tensor sV = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutV{});
-
             if (elect_one_sync()) {
                 if (cta_idx == 0) {
                     UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
@@ -555,6 +548,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     const bool dq_clear = (k_block == 0);
 
                     if (cta_idx == 0) {
+                        Tensor sK_sQ = make_tensor(
+                            make_smem_ptr(plan.u.q_kv.kv[phase].data()),
+                            SmemLayoutKVTiles<NUM_sQ_TILES>{}
+                        );
+                        Tensor sK_tQ = make_tensor(
+                            make_smem_ptr(plan.u.q_kv.kv[phase].data() + (B_TOPK / 2) * D_sQ),
+                            SmemLayoutKVTiles<NUM_tQ_TILES>{}
+                        );
+                        Tensor sV = make_tensor(
+                            make_smem_ptr(plan.u.q_kv.kv[phase].data()),
+                            SmemLayoutV{}
+                        );
+
                         plan.bar_prologue_kv.arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
                         plan.bar_prologue_kv.wait(phase);
                         ku::tcgen05_after_thread_sync();
