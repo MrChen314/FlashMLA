@@ -12,6 +12,19 @@ def calc_diff(a: torch.Tensor, b: torch.Tensor):
     return max_diff, rel_diff
 
 
+def print_band_diff(name: str, a: torch.Tensor, b: torch.Tensor, d_v: int):
+    bands = []
+    for start in range(0, d_v, 128):
+        end = min(start + 128, d_v)
+        bands.append((f"nope_{start}_{end}", start, end))
+    bands.append(("rope", d_v, a.shape[-1]))
+    for band_name, start, end in bands:
+        band_a = a[..., start:end]
+        band_b = b[..., start:end]
+        max_diff, rel_diff = calc_diff(band_a, band_b)
+        print(f"[ref vs flash][{name}] {band_name:<14} max_diff={max_diff:.6f}, rel_diff={rel_diff:.6f}")
+
+
 def ref_sparse_mla_dkv_interface(
     q: torch.Tensor,
     dO: torch.Tensor,
@@ -132,6 +145,7 @@ def test_sparse_mla_bwd_head128_2kernels_dkv(
         )
         flash_dkv_max_diff, flash_dkv_rel_diff = calc_diff(flash_dkv, ref_dkv.bfloat16())
         print(f"[ref vs flash] dKV max_diff={flash_dkv_max_diff:.6f}, rel_diff={flash_dkv_rel_diff:.6f}")
+        print_band_diff("dKV", flash_dkv.float(), ref_dkv.float(), DV)
 
         assert kk.check_is_allclose(
             "dkv",
