@@ -476,8 +476,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     );
                 }
             }
-
-            plan.bar_p_ready.wait(phase);
         }
     }
 
