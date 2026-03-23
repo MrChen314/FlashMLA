@@ -44,7 +44,7 @@ static constexpr int DKV_TILE_M = TOPK_GRANULARITY;
 static constexpr int DKV_ROWS_PER_CTA = DKV_TILE_M / 2;
 static constexpr int NOPE_COLS_PER_CTA = 256;
 static constexpr int ROPE_COLS_PER_CTA = D_ROPE / 2;
-static constexpr int NUM_THREADS = 16 * 32;
+static constexpr int NUM_THREADS = 12 * 32;
 
 static_assert(DKV_TILE_M == B_H, "dKV paired tile expects 128-row MMA tiles.");
 static_assert(DKV_ROWS_PER_CTA == 64, "Each CTA in the dKV kernel owns 64 rows.");
