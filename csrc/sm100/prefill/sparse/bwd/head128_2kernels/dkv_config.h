@@ -134,6 +134,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_ds_ready;
     transac_bar_t bar_dkv_nope_ready;
     transac_bar_t bar_dkv_rope_ready;
+    transac_bar_t bar_dkv_nope_done;
+    transac_bar_t bar_dkv_rope_done;
 
     array_aligned<uint32_t, 1> tmem_start_addr;
 };

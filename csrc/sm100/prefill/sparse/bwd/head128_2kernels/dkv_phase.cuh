@@ -87,6 +87,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         plan.bar_ds_ready.init(1);
         plan.bar_dkv_nope_ready.init(1);
         plan.bar_dkv_rope_ready.init(1);
+        plan.bar_dkv_nope_done.init(2 * kThreadsPerWarpgroup);
+        plan.bar_dkv_rope_done.init(kThreadsPerWarpgroup);
         fence_barrier_init();
     }
 
@@ -171,7 +173,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
             }
-            cluster_sync();
         }
     } else if (warp_idx == 10) {
         const bool issue_ds_tma = elect_one_sync();
@@ -193,7 +194,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
             }
-            cluster_sync();
         }
     } else {
         CUTE_NO_UNROLL
@@ -240,6 +240,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                             atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
                         }
                     }
+
+                    plan.bar_dkv_nope_done.arrive(static_cast<uint32_t>(cta_idx));
                 } else {
                     // WG1 drains the remaining 256 NoPE columns and the RoPE slice.
                     CUTE_UNROLL
@@ -258,6 +260,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                         }
                     }
 
+                    plan.bar_dkv_nope_done.arrive(static_cast<uint32_t>(cta_idx));
+
                     plan.bar_dkv_rope_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
 
@@ -271,6 +275,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                             D_V + half * ROPE_COLS_PER_HALF;
                         atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_rope_data));
                     }
+
+                    plan.bar_dkv_rope_done.arrive(static_cast<uint32_t>(cta_idx));
                 }
             }
 
@@ -290,6 +296,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
                 if (cta_idx == 0 && elect_one_sync()) {
                     plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+
+                    if (k_pair > 0) {
+                        const int prev_phase = (k_pair - 1) & 1;
+                        plan.bar_dkv_nope_done.wait(prev_phase);
+                        ku::tcgen05_after_thread_sync();
+                    }
+
                     plan.bar_s_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
                     ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
@@ -300,6 +313,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
                     ku::tcgen05_after_thread_sync();
+
+                    if (k_pair > 0) {
+                        const int prev_phase = (k_pair - 1) & 1;
+                        plan.bar_dkv_rope_done.wait(prev_phase);
+                        ku::tcgen05_after_thread_sync();
+                    }
+
                     ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, kClusterMask2Cta);
                     ku::tcgen05_after_thread_sync();
@@ -307,6 +327,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             }
         }
     }
+
+    if (warp_idx == 8 && cta_idx == 0 && elect_one_sync()) {
+        const int final_phase = (num_k_pairs - 1) & 1;
+        plan.bar_dkv_nope_done.wait(final_phase);
+        ku::tcgen05_after_thread_sync();
+        plan.bar_dkv_rope_done.wait(final_phase);
+        ku::tcgen05_after_thread_sync();
+    }
+
     cluster_sync();
 
     if (warp_idx == 8 && elect_one_sync()) {
