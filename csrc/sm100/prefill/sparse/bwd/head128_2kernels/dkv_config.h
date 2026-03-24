@@ -44,6 +44,7 @@ static constexpr int DKV_TILE_M = TOPK_GRANULARITY;
 static constexpr int DKV_ROWS_PER_CTA = DKV_TILE_M / 2;
 static constexpr int NOPE_COLS_PER_CTA = 256;
 static constexpr int ROPE_COLS_PER_CTA = D_ROPE / 2;
+static constexpr int NUM_S_DS_BUFS = 2;
 static constexpr int NUM_THREADS = 12 * 32;
 
 static_assert(DKV_TILE_M == B_H, "dKV paired tile expects 128-row MMA tiles.");
@@ -51,6 +52,7 @@ static_assert(DKV_ROWS_PER_CTA == 64, "Each CTA in the dKV kernel owns 64 rows."
 static_assert(TOPK_GRANULARITY == 2 * DKV_ROWS_PER_CTA, "The paired dKV tile must be split evenly across two CTAs.");
 static_assert(NOPE_COLS_PER_CTA * 2 == D_V, "NoPE staging must cover the full 512-dim latent width across the cluster.");
 static_assert(ROPE_COLS_PER_CTA * 2 == D_ROPE, "RoPE staging must cover the full rope width across the cluster.");
+static_assert(NUM_S_DS_BUFS == 2, "dKV kernel currently expects ping-pong shared-memory buffering for S/dS tiles.");
 
 using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
@@ -123,8 +125,8 @@ struct alignas(128) SharedMemoryPlan {
     array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;
     array_aligned<bf16, cosize_v<SmemLayoutdO>> dO;
     struct {
-        array_aligned<bf16, cosize_v<SmemLayoutS>> s;
-        array_aligned<bf16, cosize_v<SmemLayoutdS>> ds;
+        array_aligned<bf16, cosize_v<SmemLayoutS>> s[NUM_S_DS_BUFS];
+        array_aligned<bf16, cosize_v<SmemLayoutdS>> ds[NUM_S_DS_BUFS];
     } s_ds;
 
     transac_bar_t bar_q_nope_ready;

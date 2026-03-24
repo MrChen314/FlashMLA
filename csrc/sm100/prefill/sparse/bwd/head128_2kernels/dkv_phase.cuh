@@ -97,9 +97,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.q_nope.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
-    Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
-    Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
-
     if (warp_idx == 8) {
         if (elect_one_sync()) {
             Tensor gQNoPE = tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, cta_idx, s_q_idx);
@@ -158,12 +155,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         CUTE_NO_UNROLL
         for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
             if (issue_s_tma) {
-                if (k_pair > 0) {
-                    const int prev_phase = (k_pair - 1) & 1;
-                    plan.bar_dkv_nope_ready.wait(prev_phase);
+                const int phase = k_pair & 1;
+                if (k_pair >= NUM_S_DS_BUFS) {
+                    plan.bar_dkv_nope_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
                 }
 
+                Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s[phase].data()), SmemLayoutS{});
                 Tensor gS = tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, cta_idx, k_pair, s_q_idx);
                 ku::launch_tma_copy(
                     tma_params.tma_S,
@@ -179,12 +177,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         CUTE_NO_UNROLL
         for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
             if (issue_ds_tma) {
-                if (k_pair > 0) {
-                    const int prev_phase = (k_pair - 1) & 1;
-                    plan.bar_dkv_rope_ready.wait(prev_phase);
+                const int phase = k_pair & 1;
+                if (k_pair >= NUM_S_DS_BUFS) {
+                    plan.bar_dkv_rope_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
                 }
 
+                Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds[phase].data()), SmemLayoutdS{});
                 Tensor gdS = tma_params.tma_dS.get_tma_tensor(tma_params.shape_dS)(_, _, cta_idx, k_pair, s_q_idx);
                 ku::launch_tma_copy(
                     tma_params.tma_dS,
@@ -288,13 +287,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 tdKV.data().get() = tmem_cols::dKV;
                 tdKV_RoPE.data().get() = tmem_cols::dKV_RoPE;
 
-                Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS_MMA{});
-                Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS_MMA{});
                 Tensor sdO_mma_full = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO_MMA{});
                 Tensor sQNoPE_mma_full = make_tensor(make_smem_ptr(plan.q_nope.data()), SmemLayoutQNoPE_MMA{});
                 Tensor sQRoPE_mma_full = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
 
                 if (cta_idx == 0 && elect_one_sync()) {
+                    Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s[phase].data()), SmemLayoutS_MMA{});
+                    Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds[phase].data()), SmemLayoutdS_MMA{});
                     plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
 
                     if (k_pair > 0) {
