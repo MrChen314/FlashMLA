@@ -164,11 +164,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 plan.bar_s_ready,
                 TMA::CacheHintSm90::EVICT_FIRST
             );
-            if (cta_idx == 0) {
-                plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-                plan.bar_s_ready.wait(phase);
-                ku::tcgen05_after_thread_sync();
-            }
         }
 
         if (warp_idx == 10 && elect_one_sync()) {
@@ -180,15 +175,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 plan.bar_ds_ready,
                 TMA::CacheHintSm90::EVICT_FIRST
             );
-
-            if (cta_idx == 0) {
-                plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-                plan.bar_ds_ready.wait(phase);
-                ku::tcgen05_after_thread_sync();
-            }
         }
-
-        cluster_sync();
 
         if (warpgroup_idx < 2) {
             // TMEM ld row/half mapping follows the physical 4-warp lane ordering
@@ -279,7 +266,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             Tensor sQRoPE_mma_full = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
 
             if (cta_idx == 0 && elect_one_sync()) {
+                plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+                plan.bar_s_ready.wait(phase);
+                ku::tcgen05_after_thread_sync();
                 ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
+
+                plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+                plan.bar_ds_ready.wait(phase);
+                ku::tcgen05_after_thread_sync();
                 ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
