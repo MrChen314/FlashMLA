@@ -157,7 +157,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             if (issue_s_tma) {
                 const int phase = k_pair & 1;
                 if (k_pair >= NUM_S_DS_BUFS) {
-                    plan.bar_dkv_nope_ready.wait(phase);
+                    // bar_dkv_nope_ready flips every k_pair, so waiting on the same
+                    // phase after skipping one round can miss an earlier arrival and
+                    // end up waiting on the current round itself. Waiting on the
+                    // previous global phase keeps the ping-pong producer ordered
+                    // without phase aliasing.
+                    const int prev_phase = (k_pair - 1) & 1;
+                    plan.bar_dkv_nope_ready.wait(prev_phase);
                     ku::tcgen05_after_thread_sync();
                 }
 
@@ -179,7 +185,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             if (issue_ds_tma) {
                 const int phase = k_pair & 1;
                 if (k_pair >= NUM_S_DS_BUFS) {
-                    plan.bar_dkv_rope_ready.wait(phase);
+                    const int prev_phase = (k_pair - 1) & 1;
+                    plan.bar_dkv_rope_ready.wait(prev_phase);
                     ku::tcgen05_after_thread_sync();
                 }
 
