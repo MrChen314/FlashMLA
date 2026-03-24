@@ -87,8 +87,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         plan.bar_ds_ready.init(1);
         plan.bar_dkv_nope_ready.init(1);
         plan.bar_dkv_rope_ready.init(1);
-        plan.bar_dkv_nope_done.init(2 * kThreadsPerWarpgroup);
-        plan.bar_dkv_rope_done.init(kThreadsPerWarpgroup);
+        plan.bar_dkv_nope_done.init(4 * kThreadsPerWarpgroup);
+        plan.bar_dkv_rope_done.init(2 * kThreadsPerWarpgroup);
         fence_barrier_init();
     }
 
@@ -241,7 +241,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                         }
                     }
 
-                    plan.bar_dkv_nope_done.arrive(static_cast<uint32_t>(cta_idx));
+                    plan.bar_dkv_nope_done.arrive(0);
                 } else {
                     // WG1 drains the remaining 256 NoPE columns and the RoPE slice.
                     CUTE_UNROLL
@@ -260,7 +260,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                         }
                     }
 
-                    plan.bar_dkv_nope_done.arrive(static_cast<uint32_t>(cta_idx));
+                    plan.bar_dkv_nope_done.arrive(0);
 
                     plan.bar_dkv_rope_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
@@ -276,7 +276,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                         atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_rope_data));
                     }
 
-                    plan.bar_dkv_rope_done.arrive(static_cast<uint32_t>(cta_idx));
+                    plan.bar_dkv_rope_done.arrive(0);
                 }
             }
 
