@@ -35,6 +35,12 @@ void atomic_add_32floats_unrolled(float* dst, const float* src) {
         :: "l"(dst + 28), "f"(src[28]), "f"(src[29]), "f"(src[30]), "f"(src[31]) : "memory");
 }
 
+CUTE_DEVICE
+void atomic_add_64floats_unrolled(float* dst, const float* src) {
+    atomic_add_32floats_unrolled(dst, src);
+    atomic_add_32floats_unrolled(dst + 32, src + 32);
+}
+
 static constexpr int kThreadsPerWarp = 32;
 static constexpr int kWarpsPerWarpgroup = 4;
 static constexpr int kThreadsPerWarpgroup = kWarpsPerWarpgroup * kThreadsPerWarp;
@@ -220,9 +226,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 const bool row_valid = kv_idx >= 0 && kv_idx < params.s_kv && kv_idx <= max_kv_i;
                 constexpr int COLS_PER_HALF = NOPE_COLS_PER_CTA / 2;
                 constexpr int NOPE_COLS_PER_CLUSTER_HALF = NOPE_COLS_PER_CTA;
-                constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
+                constexpr int CHUNK_SIZE = 64;
+                constexpr int NUM_CHUNKS = COLS_PER_HALF / CHUNK_SIZE;
                 constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
-                static_assert(CHUNK_SIZE == 32);
+                static_assert(CHUNK_SIZE == 64);
+                static_assert(NUM_CHUNKS == 2);
                 static_assert(ROPE_COLS_PER_HALF == 32);
 
                 plan.bar_dkv_nope_ready[buf].wait(phase);
@@ -231,7 +239,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 if (warpgroup_idx == 0) {
                     // WG0 drains the first 256 NoPE columns.
                     CUTE_UNROLL
-                    for (int chunk = 0; chunk < 4; ++chunk) {
+                    for (int chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
                         float2 dkv_data[CHUNK_SIZE / 2];
                         ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
                         cutlass::arch::fence_view_async_tmem_load();
@@ -243,7 +251,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                             // TMEM [128:256] -> global [256:384]
                             float* dst = params.dKV + (int64_t)kv_idx * params.stride_dKV_s_kv +
                                 half * NOPE_COLS_PER_CLUSTER_HALF + chunk * CHUNK_SIZE;
-                            atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
+                            atomic_add_64floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
                         }
                     }
 
@@ -251,7 +259,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 } else {
                     // WG1 drains the remaining 256 NoPE columns and the RoPE slice.
                     CUTE_UNROLL
-                    for (int chunk = 0; chunk < 4; ++chunk) {
+                    for (int chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
                         float2 dkv_data[CHUNK_SIZE / 2];
                         ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + 128 + chunk * CHUNK_SIZE, dkv_data);
                         cutlass::arch::fence_view_async_tmem_load();
@@ -262,7 +270,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                             // TMEM [384:512] -> global [384:512]
                             float* dst = params.dKV + (int64_t)kv_idx * params.stride_dKV_s_kv +
                                 COLS_PER_HALF + half * NOPE_COLS_PER_CLUSTER_HALF + chunk * CHUNK_SIZE;
-                            atomic_add_32floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
+                            atomic_add_64floats_unrolled(dst, reinterpret_cast<float*>(dkv_data));
                         }
                     }
 
