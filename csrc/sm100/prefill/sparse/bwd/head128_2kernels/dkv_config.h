@@ -132,10 +132,10 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_q_nope_ready;
     transac_bar_t bar_q_rope_ready;
     transac_bar_t bar_dO_ready;
-    transac_bar_t bar_s_ready;
-    transac_bar_t bar_ds_ready;
-    transac_bar_t bar_dkv_nope_ready;
-    transac_bar_t bar_dkv_rope_ready;
+    transac_bar_t bar_s_ready[NUM_S_DS_BUFS];
+    transac_bar_t bar_ds_ready[NUM_S_DS_BUFS];
+    transac_bar_t bar_dkv_nope_ready[NUM_S_DS_BUFS];
+    transac_bar_t bar_dkv_rope_ready[NUM_S_DS_BUFS];
     transac_bar_t bar_dkv_nope_done;
     transac_bar_t bar_dkv_rope_done;
 

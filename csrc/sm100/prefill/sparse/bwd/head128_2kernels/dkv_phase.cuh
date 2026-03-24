@@ -83,10 +83,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         plan.bar_q_nope_ready.init(1);
         plan.bar_q_rope_ready.init(1);
         plan.bar_dO_ready.init(1);
-        plan.bar_s_ready.init(1);
-        plan.bar_ds_ready.init(1);
-        plan.bar_dkv_nope_ready.init(1);
-        plan.bar_dkv_rope_ready.init(1);
+        CUTE_UNROLL
+        for (int buf = 0; buf < NUM_S_DS_BUFS; ++buf) {
+            plan.bar_s_ready[buf].init(1);
+            plan.bar_ds_ready[buf].init(1);
+            plan.bar_dkv_nope_ready[buf].init(1);
+            plan.bar_dkv_rope_ready[buf].init(1);
+        }
         plan.bar_dkv_nope_done.init(4 * kThreadsPerWarpgroup);
         plan.bar_dkv_rope_done.init(2 * kThreadsPerWarpgroup);
         fence_barrier_init();
@@ -155,25 +158,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         CUTE_NO_UNROLL
         for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
             if (issue_s_tma) {
-                const int phase = k_pair & 1;
+                const int buf = k_pair % NUM_S_DS_BUFS;
+                const int phase = (k_pair / NUM_S_DS_BUFS) & 1;
                 if (k_pair >= NUM_S_DS_BUFS) {
-                    // bar_dkv_nope_ready flips every k_pair, so waiting on the same
-                    // phase after skipping one round can miss an earlier arrival and
-                    // end up waiting on the current round itself. Waiting on the
-                    // previous global phase keeps the ping-pong producer ordered
-                    // without phase aliasing.
-                    const int prev_phase = (k_pair - 1) & 1;
-                    plan.bar_dkv_nope_ready.wait(prev_phase);
+                    plan.bar_dkv_nope_ready[buf].wait(phase ^ 1);
                     ku::tcgen05_after_thread_sync();
                 }
 
-                Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s[phase].data()), SmemLayoutS{});
+                Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s[buf].data()), SmemLayoutS{});
                 Tensor gS = tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, cta_idx, k_pair, s_q_idx);
                 ku::launch_tma_copy(
                     tma_params.tma_S,
                     gS,
                     sS,
-                    plan.bar_s_ready,
+                    plan.bar_s_ready[buf],
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
             }
@@ -183,20 +181,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         CUTE_NO_UNROLL
         for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
             if (issue_ds_tma) {
-                const int phase = k_pair & 1;
+                const int buf = k_pair % NUM_S_DS_BUFS;
+                const int phase = (k_pair / NUM_S_DS_BUFS) & 1;
                 if (k_pair >= NUM_S_DS_BUFS) {
-                    const int prev_phase = (k_pair - 1) & 1;
-                    plan.bar_dkv_rope_ready.wait(prev_phase);
+                    plan.bar_dkv_rope_ready[buf].wait(phase ^ 1);
                     ku::tcgen05_after_thread_sync();
                 }
 
-                Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds[phase].data()), SmemLayoutdS{});
+                Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds[buf].data()), SmemLayoutdS{});
                 Tensor gdS = tma_params.tma_dS.get_tma_tensor(tma_params.shape_dS)(_, _, cta_idx, k_pair, s_q_idx);
                 ku::launch_tma_copy(
                     tma_params.tma_dS,
                     gdS,
                     sDS,
-                    plan.bar_ds_ready,
+                    plan.bar_ds_ready[buf],
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
             }
@@ -204,7 +202,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     } else {
         CUTE_NO_UNROLL
         for (int k_pair = 0; k_pair < num_k_pairs; ++k_pair) {
-            const int phase = k_pair & 1;
+            const int buf = k_pair % NUM_S_DS_BUFS;
+            const int phase = (k_pair / NUM_S_DS_BUFS) & 1;
+            const int round_phase = k_pair & 1;
 
             if (warpgroup_idx < 2) {
                 // TMEM ld row/half mapping follows the physical 4-warp lane ordering
@@ -225,7 +225,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 static_assert(CHUNK_SIZE == 32);
                 static_assert(ROPE_COLS_PER_HALF == 32);
 
-                plan.bar_dkv_nope_ready.wait(phase);
+                plan.bar_dkv_nope_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
 
                 if (warpgroup_idx == 0) {
@@ -268,7 +268,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
                     plan.bar_dkv_nope_done.arrive(static_cast<uint32_t>(0));
 
-                    plan.bar_dkv_rope_ready.wait(phase);
+                    plan.bar_dkv_rope_ready[buf].wait(phase);
                     ku::tcgen05_after_thread_sync();
 
                     float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
@@ -299,35 +299,33 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 Tensor sQRoPE_mma_full = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE_MMA{});
 
                 if (cta_idx == 0 && elect_one_sync()) {
-                    Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s[phase].data()), SmemLayoutS_MMA{});
-                    Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds[phase].data()), SmemLayoutdS_MMA{});
-                    plan.bar_s_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+                    Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s[buf].data()), SmemLayoutS_MMA{});
+                    Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds[buf].data()), SmemLayoutdS_MMA{});
+                    plan.bar_s_ready[buf].arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
 
                     if (k_pair > 0) {
-                        const int prev_phase = (k_pair - 1) & 1;
-                        plan.bar_dkv_nope_done.wait(prev_phase);
+                        plan.bar_dkv_nope_done.wait(round_phase ^ 1);
                         ku::tcgen05_after_thread_sync();
                     }
 
-                    plan.bar_s_ready.wait(phase);
+                    plan.bar_s_ready[buf].wait(phase);
                     ku::tcgen05_after_thread_sync();
                     ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_mma_full, tdKV, true);
 
-                    plan.bar_ds_ready.arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-                    plan.bar_ds_ready.wait(phase);
+                    plan.bar_ds_ready[buf].arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
+                    plan.bar_ds_ready[buf].wait(phase);
                     ku::tcgen05_after_thread_sync();
                     ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQNoPE_mma_full, tdKV, false);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready, kClusterMask2Cta);
+                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_nope_ready[buf], kClusterMask2Cta);
                     ku::tcgen05_after_thread_sync();
 
                     if (k_pair > 0) {
-                        const int prev_phase = (k_pair - 1) & 1;
-                        plan.bar_dkv_rope_done.wait(prev_phase);
+                        plan.bar_dkv_rope_done.wait(round_phase ^ 1);
                         ku::tcgen05_after_thread_sync();
                     }
 
                     ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
-                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready, kClusterMask2Cta);
+                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready[buf], kClusterMask2Cta);
                     ku::tcgen05_after_thread_sync();
                 }
             }
