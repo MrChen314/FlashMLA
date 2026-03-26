@@ -105,25 +105,25 @@ using SmemLayoutKVTilesTransposed = decltype(coalesce(tile_to_shape(
 using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
 using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
-using SmemLayoutKPeerNoPE = decltype(coalesce(tile_to_shape(
+using SmemLayoutKDQNoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_TOPK>, Int<D_V / 2>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutKPeerRoPE = decltype(coalesce(tile_to_shape(
+using SmemLayoutKDQRoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW64_Atom<bf16>{},
     Shape<Int<B_TOPK>, Int<D_ROPE / 2>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutKPeerNoPE_MMA = decltype(coalesce(tile_to_shape(
+using SmemLayoutKDQNoPE_MMA = decltype(coalesce(tile_to_shape(
     UMMA::Layout_MN_SW128_Atom<bf16>{},
     Shape<Int<D_V / 2>, Int<B_TOPK>>{},
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutKPeerRoPE_MMA = decltype(coalesce(tile_to_shape(
+using SmemLayoutKDQRoPE_MMA = decltype(coalesce(tile_to_shape(
     UMMA::Layout_MN_SW64_Atom<bf16>{},
     Shape<Int<D_ROPE / 2>, Int<B_TOPK>>{},
     Step<_2, _1>{}
@@ -165,11 +165,14 @@ using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
-static_assert(cosize_v<SmemLayoutKPeerNoPE> == cosize_v<SmemLayoutKPeerNoPE_MMA>);
-static_assert(cosize_v<SmemLayoutKPeerRoPE> == cosize_v<SmemLayoutKPeerRoPE_MMA>);
-static_assert(cosize_v<SmemLayoutKV> == cosize_v<SmemLayoutKPeerNoPE> + cosize_v<SmemLayoutKPeerRoPE>);
+static_assert(cosize_v<SmemLayoutKDQNoPE> == cosize_v<SmemLayoutKDQNoPE_MMA>);
+static_assert(cosize_v<SmemLayoutKDQRoPE> == cosize_v<SmemLayoutKDQRoPE_MMA>);
+static_assert(cosize_v<SmemLayoutKV> == cosize_v<SmemLayoutKDQNoPE> + cosize_v<SmemLayoutKDQRoPE>);
 static_assert(cosize_v<SmemLayoutQ> == cosize_v<SmemLayoutQNoPE> + cosize_v<SmemLayoutQRoPE>);
-static_assert(cosize_v<SmemLayoutQ> <= cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>> + cosize_v<SmemLayoutKV> + cosize_v<SmemLayoutKV>);
+
+static constexpr int Q_FULL_STAGE_OFFSET = cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>> + cosize_v<SmemLayoutKV>;
+static_assert(cosize_v<SmemLayoutQ> <= 2 * cosize_v<SmemLayoutKV>,
+              "q_full should fit in the kv[1] + k_dq overlap window.");
 
 struct tmem_cols {
     static constexpr int dQ = 0;
@@ -189,11 +192,16 @@ static_assert(tmem_cols::kNumUsedCols == 512, "dq kernel should fully use the 51
 
 struct alignas(128) SharedMemoryPlan {
     union {
-        array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
+        struct {
+            // Keep q_full on top of kv[1] + k_dq so kv[0] can be filled
+            // before UTCCP finishes consuming the staged q tile.
+            array_aligned<bf16, Q_FULL_STAGE_OFFSET> q_full_pad;
+            array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
+        } q_stage;
         struct {
             array_aligned<bf16, cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>>> sq;
             array_aligned<bf16, cosize_v<SmemLayoutKV>> kv[NUM_KV_BUFS];
-            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;
+            array_aligned<bf16, cosize_v<SmemLayoutKV>> k_dq;
         } q_kv;
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;
     } u;
@@ -216,8 +224,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_ds_ready;
     transac_bar_t bar_k_valid_free;
     transac_bar_t bar_k_valid_ready;
-    transac_bar_t bar_kv_peer_nope_ready;
-    transac_bar_t bar_kv_peer_rope_ready;
+    transac_bar_t bar_k_dq_nope_ready;
+    transac_bar_t bar_k_dq_rope_ready;
     transac_bar_t bar_dq_ready;
 
     array_aligned<uint32_t, 1> tmem_start_addr;

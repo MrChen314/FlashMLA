@@ -95,16 +95,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         plan.bar_ds_ready.init(kThreadsPerWarpgroup);
         plan.bar_k_valid_ready.init(B_TOPK / 8);
         plan.bar_k_valid_free.init(kThreadsPerWarpgroup);
-        plan.bar_kv_peer_nope_ready.init(1);
-        plan.bar_kv_peer_rope_ready.init(1);
+        plan.bar_k_dq_nope_ready.init(1);
+        plan.bar_k_dq_rope_ready.init(1);
         plan.bar_dq_ready.init(1);
         fence_barrier_init();
     }
 
     cluster_sync();
 
-    Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQNoPE{});
-    Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_V), SmemLayoutQRoPE{});
+    Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_stage.q_full.data()), SmemLayoutQNoPE{});
+    Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_stage.q_full.data() + (B_H / 2) * D_V), SmemLayoutQRoPE{});
     Tensor sQ = make_tensor(make_smem_ptr(plan.u.q_kv.sq.data()), SmemLayoutQTiles<NUM_sQ_TILES>{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
 
@@ -375,20 +375,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
 
         if (elect_one_sync()) {
-            plan.bar_prologue_utccp.wait(0);
-        }
+            CUTE_NO_UNROLL
+            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+                const int phase = k_block & 1;
 
-        CUTE_NO_UNROLL
-        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-            const int phase = k_block & 1;
+                if (k_block == 1) {
+                    plan.bar_prologue_utccp.wait(0);
+                }
 
-            if (k_block >= NUM_KV_BUFS) {
-                // Reuse the ping-pong KV buffer only after the same-phase dQ consumers
-                // have finished the previous round that touched it.
-                plan.bar_dq_ready.wait(phase);
-            }
+                if (k_block >= NUM_KV_BUFS) {
+                    // Reuse the ping-pong KV buffer only after the same-phase dQ consumers
+                    // have finished the previous round that touched it.
+                    plan.bar_dq_ready.wait(phase);
+                }
 
-            if (elect_one_sync()) {
                 bf16* sKV_base = plan.u.q_kv.kv[phase].data() + local_warp_idx * 4 * 64;
                 int4 local_indices4[NUM_LOCAL_ROWS_PER_WARP];
                 CUTE_UNROLL
@@ -413,9 +413,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         );
                     }
                 }
+                plan.bar_p_ready.wait(phase);
             }
-
-            plan.bar_p_ready.wait(phase);
         }
     }
 
@@ -423,22 +422,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int NUM_WARPS = kWarpsPerWarpgroup;
         static_assert(B_TOPK % (4 * NUM_WARPS) == 0);
         constexpr int NUM_DQ_ROWS_PER_WARP = B_TOPK / 4 / NUM_WARPS;
-        bf16* sKPeerNoPE_base = plan.u.q_kv.kv_peer.data();
-        bf16* sKPeerRoPE_base = plan.u.q_kv.kv_peer.data() + cosize_v<SmemLayoutKPeerNoPE>;
+        bf16* sKDQNoPE_base = plan.u.q_kv.k_dq.data();
+        bf16* sKDQRoPE_base = plan.u.q_kv.k_dq.data() + cosize_v<SmemLayoutKDQNoPE>;
 
         if (elect_one_sync()) {
             plan.bar_prologue_utccp.wait(0);
-        }
 
-        CUTE_NO_UNROLL
-        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-            const int phase = k_block & 1;
+            CUTE_NO_UNROLL
+            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+                const int phase = k_block & 1;
 
-            if (k_block > 0) {
-                plan.bar_dq_ready.wait((k_block - 1) & 1);
-            }
+                if (k_block > 0) {
+                    plan.bar_dq_ready.wait((k_block - 1) & 1);
+                }
 
-            if (elect_one_sync()) {
                 int4 dq_indices4[NUM_DQ_ROWS_PER_WARP];
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_DQ_ROWS_PER_WARP; ++local_row) {
@@ -454,22 +451,22 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
                     CUTE_UNROLL
                     for (int local_col = 0; local_col < D_V / 64 / 2; ++local_col) {
-                        bf16* peer_nope_dst = sKPeerNoPE_base + dq_row * 64 + local_col * (B_TOPK * 64);
+                        bf16* k_dq_nope_dst = sKDQNoPE_base + dq_row * 64 + local_col * (B_TOPK * 64);
                         ku::tma_gather4_cta_group_2<true>(
                             &(tma_params.tensor_map_kv_nope),
-                            plan.bar_kv_peer_nope_ready,
-                            peer_nope_dst,
+                            plan.bar_k_dq_nope_ready,
+                            k_dq_nope_dst,
                             cta_idx * (D_V / 2) + local_col * 64,
                             dq_indices4[local_row],
                             (int64_t)TMA::CacheHintSm90::EVICT_LAST
                         );
                     }
 
-                    bf16* peer_rope_dst = sKPeerRoPE_base + dq_row * (D_ROPE / 2);
+                    bf16* k_dq_rope_dst = sKDQRoPE_base + dq_row * (D_ROPE / 2);
                     ku::tma_gather4_cta_group_2<true>(
                         &(tma_params.tensor_map_kv_rope),
-                        plan.bar_kv_peer_rope_ready,
-                        peer_rope_dst,
+                        plan.bar_k_dq_rope_ready,
+                        k_dq_rope_dst,
                         cta_idx * (D_ROPE / 2),
                         dq_indices4[local_row],
                         (int64_t)TMA::CacheHintSm90::EVICT_LAST
@@ -497,7 +494,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                 if (cta_idx == 0) {
                     UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                         make_tensor(
-                            make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_sQ),
+                            make_smem_ptr(plan.u.q_stage.q_full.data() + (B_H / 2) * D_sQ),
                             tile_to_shape(
                                 UMMA::Layout_K_SW128_Atom<bf16>{},
                                 Shape<Int<B_H / 2>, Int<64>>{}
@@ -534,10 +531,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                 tdQ_RoPE.data().get() = tmem_cols::dQ_RoPE;
 
                 Tensor sDS_t = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
-                Tensor sK_peer_nope_t = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKPeerNoPE_MMA{});
-                Tensor sK_peer_rope_t = make_tensor(
-                    make_smem_ptr(plan.u.q_kv.kv_peer.data() + cosize_v<SmemLayoutKPeerNoPE>),
-                    SmemLayoutKPeerRoPE_MMA{}
+                Tensor sK_dq_nope_t = make_tensor(make_smem_ptr(plan.u.q_kv.k_dq.data()), SmemLayoutKDQNoPE_MMA{});
+                Tensor sK_dq_rope_t = make_tensor(
+                    make_smem_ptr(plan.u.q_kv.k_dq.data() + cosize_v<SmemLayoutKDQNoPE>),
+                    SmemLayoutKDQRoPE_MMA{}
                 );
 
                 CUTE_NO_UNROLL
@@ -576,15 +573,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     ku::tcgen05_after_thread_sync();
 
                     if (cta_idx == 0) {
-                        plan.bar_kv_peer_nope_ready.arrive_and_expect_tx(B_TOPK * D_V * sizeof(bf16));
-                        plan.bar_kv_peer_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));
-                        plan.bar_kv_peer_nope_ready.wait(phase);
+                        plan.bar_k_dq_nope_ready.arrive_and_expect_tx(B_TOPK * D_V * sizeof(bf16));
+                        plan.bar_k_dq_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));
+                        plan.bar_k_dq_nope_ready.wait(phase);
                         ku::tcgen05_after_thread_sync();
-                        ku::utcmma_ss(tiled_mma_dQ, sDS_t, sK_peer_nope_t, tdQ, dq_clear);
+                        ku::utcmma_ss(tiled_mma_dQ, sDS_t, sK_dq_nope_t, tdQ, dq_clear);
 
-                        plan.bar_kv_peer_rope_ready.wait(phase);
+                        plan.bar_k_dq_rope_ready.wait(phase);
                         ku::tcgen05_after_thread_sync();
-                        ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t, sK_peer_rope_t, tdQ_RoPE, dq_clear);
+                        ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t, sK_dq_rope_t, tdQ_RoPE, dq_clear);
                         ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dq_ready, kClusterMask2Cta);
                         ku::tcgen05_after_thread_sync();
                     }
