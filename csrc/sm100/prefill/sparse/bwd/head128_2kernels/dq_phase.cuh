@@ -367,9 +367,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     thr_tma_dq.partition_S(sdQ),
                     thr_tma_dq.partition_D(gdQ)
                 );
-                cute::tma_store_arrive();
-                cute::tma_store_wait<0>();
             }
+        }
+
+        if (warp_idx == 0) {
+            TMEM::Allocator2Sm().free(tmem_base, 512);
         }
     }
 
@@ -668,11 +670,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         }
     }
 
-    cluster_sync();
-
-    if (warp_idx == 0 && elect_one_sync()) {
-        TMEM::Allocator2Sm().free(tmem_base, 512);
-    }
 #endif
 }
 

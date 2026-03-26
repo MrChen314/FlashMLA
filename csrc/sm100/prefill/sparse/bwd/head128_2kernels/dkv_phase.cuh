@@ -350,7 +350,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
 
     cluster_sync();
 
-    if (warp_idx == 8 && elect_one_sync()) {
+    if (warp_idx == 8) {
         TMEM::Allocator2Sm().free(tmem_base, 512);
     }
 #endif
