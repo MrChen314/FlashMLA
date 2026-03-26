@@ -170,7 +170,6 @@ static_assert(cosize_v<SmemLayoutKDQRoPE> == cosize_v<SmemLayoutKDQRoPE_MMA>);
 static_assert(cosize_v<SmemLayoutKV> == cosize_v<SmemLayoutKDQNoPE> + cosize_v<SmemLayoutKDQRoPE>);
 static_assert(cosize_v<SmemLayoutQ> == cosize_v<SmemLayoutQNoPE> + cosize_v<SmemLayoutQRoPE>);
 
-static constexpr int Q_FULL_STAGE_OFFSET = cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>> + cosize_v<SmemLayoutKV>;
 static_assert(cosize_v<SmemLayoutQ> <= 2 * cosize_v<SmemLayoutKV>,
               "q_full should fit in the kv[1] + k_dq overlap window.");
 
@@ -192,12 +191,7 @@ static_assert(tmem_cols::kNumUsedCols == 512, "dq kernel should fully use the 51
 
 struct alignas(128) SharedMemoryPlan {
     union {
-        struct {
-            // Keep q_full on top of kv[1] + k_dq so kv[0] can be filled
-            // before UTCCP finishes consuming the staged q tile.
-            array_aligned<bf16, Q_FULL_STAGE_OFFSET> q_full_pad;
-            array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
-        } q_stage;
+        array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
         struct {
             array_aligned<bf16, cosize_v<SmemLayoutQTiles<NUM_sQ_TILES>>> sq;
             array_aligned<bf16, cosize_v<SmemLayoutKV>> kv[NUM_KV_BUFS];

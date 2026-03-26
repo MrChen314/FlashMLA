@@ -103,8 +103,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
     cluster_sync();
 
-    Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_stage.q_full.data()), SmemLayoutQNoPE{});
-    Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_stage.q_full.data() + (B_H / 2) * D_V), SmemLayoutQRoPE{});
+    Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQNoPE{});
+    Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_V), SmemLayoutQRoPE{});
     Tensor sQ = make_tensor(make_smem_ptr(plan.u.q_kv.sq.data()), SmemLayoutQTiles<NUM_sQ_TILES>{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
 
@@ -375,18 +375,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
 
         if (elect_one_sync()) {
+            plan.bar_prologue_utccp.wait(0);
+
             CUTE_NO_UNROLL
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
                 const int phase = k_block & 1;
 
-                if (k_block == 1) {
-                    plan.bar_prologue_utccp.wait(0);
-                }
-
                 if (k_block >= NUM_KV_BUFS) {
                     // Reuse the ping-pong KV buffer only after the same-phase dQ consumers
                     // have finished the previous round that touched it.
-                    plan.bar_dq_ready.wait(phase);
+                    plan.bar_dp_ready.wait(phase);
                 }
 
                 bf16* sKV_base = plan.u.q_kv.kv[phase].data() + local_warp_idx * 4 * 64;
@@ -413,7 +411,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         );
                     }
                 }
-                plan.bar_p_ready.wait(phase);
             }
         }
     }
@@ -494,7 +491,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                 if (cta_idx == 0) {
                     UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                         make_tensor(
-                            make_smem_ptr(plan.u.q_stage.q_full.data() + (B_H / 2) * D_sQ),
+                            make_smem_ptr(plan.u.q_full.data() + (B_H / 2) * D_sQ),
                             tile_to_shape(
                                 UMMA::Layout_K_SW128_Atom<bf16>{},
                                 Shape<Int<B_H / 2>, Int<64>>{}
