@@ -87,10 +87,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         plan.bar_prologue_q_nope.init(1);
         plan.bar_prologue_q_rope.init(1);
         plan.bar_prologue_utccp.init(1);
-        plan.bar_prologue_kv.init(1);
         plan.bar_prologue_dO.init(1);
-        plan.bar_p_ready.init(1);
-        plan.bar_dp_ready.init(1);
         plan.bar_s_ready.init(kThreadsPerWarpgroup);
         plan.bar_ds_ready.init(kThreadsPerWarpgroup);
         plan.bar_k_valid_ready.init(B_TOPK / 8);
@@ -98,6 +95,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         plan.bar_k_dq_nope_ready.init(1);
         plan.bar_k_dq_rope_ready.init(1);
         plan.bar_dq_ready.init(1);
+        for (int buf = 0; buf < NUM_KV_BUFS; ++buf) {
+            plan.bar_prologue_kv[buf].init(1);
+            plan.bar_p_ready[buf].init(1);
+            plan.bar_dp_ready[buf].init(1);
+        }
         fence_barrier_init();
     }
 
@@ -166,9 +168,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-            const int phase = k_block & 1;
+            const int kv_buf = k_block % NUM_KV_BUFS;
+            const int kv_phase = (k_block / NUM_KV_BUFS) & 1;
+            const int round_phase = k_block & 1;
 
-            plan.bar_p_ready.wait(phase);
+            plan.bar_p_ready[kv_buf].wait(kv_phase);
             ku::tcgen05_after_thread_sync();
 
             float2 p[(B_TOPK / 2) / 2];
@@ -176,7 +180,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
 
-            plan.bar_k_valid_ready.wait(phase);
+            plan.bar_k_valid_ready.wait(round_phase);
             const uint32_t is_k_valid_lo =
                 *(uint32_t*)(plan.is_k_valid + (idx_in_softmax >= S_DS_ROWS_PER_CTA ? B_TOPK / 8 / 2 : 0));
             float* p_float = (float*)p;
@@ -225,7 +229,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 2);
             NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 2);
 
-            plan.bar_dp_ready.wait(phase);
+            plan.bar_dp_ready[kv_buf].wait(kv_phase);
             ku::tcgen05_after_thread_sync();
 
             constexpr int DP_CHUNK_F2 = SMEM_VEC_F2;
@@ -379,15 +383,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             CUTE_NO_UNROLL
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-                const int phase = k_block & 1;
+                const int buf = k_block % NUM_KV_BUFS;
+                const int phase = (k_block / NUM_KV_BUFS) & 1;
 
                 if (k_block >= NUM_KV_BUFS) {
                     // Reuse the ping-pong KV buffer only after the same-phase dQ consumers
                     // have finished the previous round that touched it.
-                    plan.bar_dp_ready.wait(phase);
+                    plan.bar_dp_ready[buf].wait(phase ^ 1);
                 }
 
-                bf16* sKV_base = plan.u.q_kv.kv[phase].data() + local_warp_idx * 4 * 64;
+                bf16* sKV_base = plan.u.q_kv.kv[buf].data() + local_warp_idx * 4 * 64;
                 int4 local_indices4[NUM_LOCAL_ROWS_PER_WARP];
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -403,7 +408,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     for (int local_col = 0; local_col < D_K / 64; ++local_col) {
                         ku::tma_gather4_cta_group_2<true>(
                             &(tma_params.tensor_map_kv),
-                            plan.bar_prologue_kv,
+                            plan.bar_prologue_kv[buf],
                             sKV_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
                             local_col * 64,
                             local_indices4[local_row],
@@ -536,47 +541,49 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
                 CUTE_NO_UNROLL
                 for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-                    const int phase = k_block & 1;
+                    const int kv_buf = k_block % NUM_KV_BUFS;
+                    const int kv_phase = (k_block / NUM_KV_BUFS) & 1;
+                    const int round_phase = k_block & 1;
                     const bool dq_clear = (k_block == 0);
 
                     if (cta_idx == 0) {
                         Tensor sK_sQ = make_tensor(
-                            make_smem_ptr(plan.u.q_kv.kv[phase].data()),
+                            make_smem_ptr(plan.u.q_kv.kv[kv_buf].data()),
                             SmemLayoutKVTiles<NUM_sQ_TILES>{}
                         );
                         Tensor sK_tQ = make_tensor(
-                            make_smem_ptr(plan.u.q_kv.kv[phase].data() + (B_TOPK / 2) * D_sQ),
+                            make_smem_ptr(plan.u.q_kv.kv[kv_buf].data() + (B_TOPK / 2) * D_sQ),
                             SmemLayoutKVTiles<NUM_tQ_TILES>{}
                         );
                         Tensor sV = make_tensor(
-                            make_smem_ptr(plan.u.q_kv.kv[phase].data()),
+                            make_smem_ptr(plan.u.q_kv.kv[kv_buf].data()),
                             SmemLayoutV{}
                         );
 
-                        plan.bar_prologue_kv.arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
-                        plan.bar_prologue_kv.wait(phase);
+                        plan.bar_prologue_kv[kv_buf].arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
+                        plan.bar_prologue_kv[kv_buf].wait(kv_phase);
                         ku::tcgen05_after_thread_sync();
                         ku::utcmma_ss(tiled_mma_P_sQ, sQ, sK_sQ, tP, true);
                         ku::utcmma_ts(tiled_mma_P_tQ, tQ, sK_tQ, tP, false);
-                        ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_p_ready, 1 | 2);
+                        ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_p_ready[kv_buf], 1 | 2);
                         ku::tcgen05_after_thread_sync();
 
                         ku::utcmma_ss(tiled_mma_dP, sdO, sV, tdP, true);
-                        ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dp_ready, 1 | 2);
+                        ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dp_ready[kv_buf], 1 | 2);
                         ku::tcgen05_after_thread_sync();
                     }
 
-                    plan.bar_ds_ready.wait(phase);
+                    plan.bar_ds_ready.wait(round_phase);
                     ku::tcgen05_after_thread_sync();
 
                     if (cta_idx == 0) {
                         plan.bar_k_dq_nope_ready.arrive_and_expect_tx(B_TOPK * D_V * sizeof(bf16));
                         plan.bar_k_dq_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));
-                        plan.bar_k_dq_nope_ready.wait(phase);
+                        plan.bar_k_dq_nope_ready.wait(round_phase);
                         ku::tcgen05_after_thread_sync();
                         ku::utcmma_ss(tiled_mma_dQ, sDS_t, sK_dq_nope_t, tdQ, dq_clear);
 
-                        plan.bar_k_dq_rope_ready.wait(phase);
+                        plan.bar_k_dq_rope_ready.wait(round_phase);
                         ku::tcgen05_after_thread_sync();
                         ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t, sK_dq_rope_t, tdQ_RoPE, dq_clear);
                         ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dq_ready, kClusterMask2Cta);
