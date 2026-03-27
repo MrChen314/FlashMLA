@@ -89,7 +89,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         plan.bar_prologue_utccp.init(1);
         plan.bar_prologue_dO.init(1);
         plan.bar_s_ready.init(kThreadsPerWarpgroup);
-        plan.bar_ds_ready.init(kThreadsPerWarpgroup);
+        plan.bar_ds_ready.init(kThreadsPerWarpgroup * 2);
         plan.bar_k_valid_ready.init(B_TOPK / 8);
         plan.bar_k_valid_free.init(kThreadsPerWarpgroup);
         plan.bar_k_dq_nope_ready.init(1);
@@ -276,7 +276,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             fence_view_async_shared();
             __threadfence_block();
 
-            plan.bar_ds_ready.arrive(static_cast<uint32_t>(cta_idx));
+            plan.bar_ds_ready.arrive(0u);
             NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 3);
             NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 3);
         }
@@ -573,12 +573,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         ku::utcmma_ss(tiled_mma_dP, sdO, sV, tdP, true);
                         ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dp_ready[kv_buf], 1 | 2);
                         ku::tcgen05_after_thread_sync();
-                    }
 
-                    plan.bar_ds_ready.wait(round_phase);
-                    ku::tcgen05_after_thread_sync();
+                        plan.bar_ds_ready.wait(round_phase);
+                        ku::tcgen05_after_thread_sync();
 
-                    if (cta_idx == 0) {
                         plan.bar_k_dq_nope_ready.arrive_and_expect_tx(B_TOPK * D_V * sizeof(bf16));
                         plan.bar_k_dq_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));
                         plan.bar_k_dq_nope_ready.wait(round_phase);
