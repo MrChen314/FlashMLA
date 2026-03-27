@@ -215,7 +215,10 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_p_ready[NUM_KV_BUFS];
     transac_bar_t bar_dp_ready[NUM_KV_BUFS];
     transac_bar_t bar_s_ready;
+    transac_bar_t bar_s_store_done;
     transac_bar_t bar_ds_ready;
+    transac_bar_t bar_ds_store_ready;
+    transac_bar_t bar_ds_store_done;
     transac_bar_t bar_k_valid_free;
     transac_bar_t bar_k_valid_ready;
     transac_bar_t bar_k_dq_nope_ready;

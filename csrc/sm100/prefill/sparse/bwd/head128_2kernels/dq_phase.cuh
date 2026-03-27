@@ -89,7 +89,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         plan.bar_prologue_utccp.init(1);
         plan.bar_prologue_dO.init(1);
         plan.bar_s_ready.init(kThreadsPerWarpgroup);
+        plan.bar_s_store_done.init(1);
         plan.bar_ds_ready.init(kThreadsPerWarpgroup * 2);
+        plan.bar_ds_store_ready.init(kThreadsPerWarpgroup);
+        plan.bar_ds_store_done.init(1);
         plan.bar_k_valid_ready.init(B_TOPK / 8);
         plan.bar_k_valid_free.init(kThreadsPerWarpgroup);
         plan.bar_k_dq_nope_ready.init(1);
@@ -192,6 +195,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             }
             plan.bar_k_valid_free.arrive();
 
+            if (k_block > 0) {
+                plan.bar_s_store_done.wait((k_block - 1) & 1);
+            }
+
             CUTE_UNROLL
             for (int vec = 0; vec < NUM_SMEM_VEC_STORES; ++vec) {
                 const int base_idx = vec * SMEM_VEC_F2;
@@ -226,14 +233,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             __threadfence_block();
 
             plan.bar_s_ready.arrive(static_cast<uint32_t>(cta_idx));
-            NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 2);
-            NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 2);
 
             plan.bar_dp_ready[kv_buf].wait(kv_phase);
             ku::tcgen05_after_thread_sync();
 
             constexpr int DP_CHUNK_F2 = SMEM_VEC_F2;
             constexpr int NUM_DP_CHUNKS = (B_TOPK / 2) / 2 / DP_CHUNK_F2;
+            if (k_block > 0) {
+                plan.bar_ds_store_done.wait((k_block - 1) & 1);
+            }
             CUTE_UNROLL
             for (int ch = 0; ch < NUM_DP_CHUNKS; ++ch) {
                 float2 dp[DP_CHUNK_F2];
@@ -277,8 +285,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             __threadfence_block();
 
             plan.bar_ds_ready.arrive(0u);
-            NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 3);
-            NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 3);
+            plan.bar_ds_store_ready.arrive(static_cast<uint32_t>(cta_idx));
         }
 
         const int final_phase = (num_k_blocks - 1) & 1;
@@ -623,10 +630,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
             auto thr_tma_s = tma_params.tma_S.get_slice(_0{});
 
-            CUTE_NO_UNROLL
-            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-                NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 2);
-                if (elect_one_sync()) {
+            if (elect_one_sync()) {
+                CUTE_NO_UNROLL
+                for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+                    if (k_block > 0) {
+                        cute::tma_store_wait<0>();
+                        plan.bar_s_store_done.arrive(static_cast<uint32_t>(cta_idx));
+                    }
+                    plan.bar_s_ready.wait(k_block & 1);
                     Tensor gS = flat_divide(
                         tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, s_q_idx),
                         Shape<Int<B_H / 2>, Int<B_TOPK>>{}
@@ -637,9 +648,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         thr_tma_s.partition_D(gS)
                     );
                     cute::tma_store_arrive();
-                    cute::tma_store_wait<0>();
                 }
-                NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 2);
             }
         }
 
@@ -647,10 +656,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
             auto thr_tma_ds = tma_params.tma_dS.get_slice(_0{});
 
-            CUTE_NO_UNROLL
-            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-                NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 3);
-                if (elect_one_sync()) {
+            if (elect_one_sync()) {
+                CUTE_NO_UNROLL
+                for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+                    if (k_block > 0) {
+                        cute::tma_store_wait<0>();
+                        plan.bar_ds_store_done.arrive(static_cast<uint32_t>(cta_idx));
+                    }
+                    plan.bar_ds_store_ready.wait(k_block & 1);
                     Tensor gdS = flat_divide(
                         tma_params.tma_dS.get_tma_tensor(tma_params.shape_dS)(_, _, s_q_idx),
                         Shape<Int<B_H / 2>, Int<B_TOPK>>{}
@@ -661,9 +674,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         thr_tma_ds.partition_D(gdS)
                     );
                     cute::tma_store_arrive();
-                    cute::tma_store_wait<0>();
                 }
-                NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup + kThreadsPerWarp, 3);
             }
         }
     }
