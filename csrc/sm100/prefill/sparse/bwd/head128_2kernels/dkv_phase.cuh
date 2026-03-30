@@ -277,11 +277,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     plan.bar_dkv_rope_done.arrive(static_cast<uint32_t>(0));
                 }
             }
-
-            NamedBarrier::arrive_and_wait(kThreadsPerWarpgroup * 2, 0);
-            if (warp_idx == 0) {
-                TMEM::Allocator2Sm().free(tmem_base, 512);
-            }
         }
 
         if (cta_idx == 0 && warp_idx == 8 && elect_one_sync()) {
@@ -341,6 +336,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 ku::tcgen05_after_thread_sync();
             }
         }
+    }
+
+    cluster_sync();
+    if (warp_idx == 0) {
+        TMEM::Allocator2Sm().free(tmem_base, 512);
     }
 #endif
 }
