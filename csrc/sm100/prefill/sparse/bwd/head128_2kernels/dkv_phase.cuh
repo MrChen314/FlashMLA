@@ -3,7 +3,6 @@
 #include "dkv_config.h"
 
 #include <cstring>
-#include <cstdio>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/arch.h>
 #include <cutlass/cuda_host_adapter.hpp>
@@ -51,26 +50,6 @@ static constexpr uint16_t kClusterMask2Cta = 0x3;
 static_assert(NUM_THREADS == kNumWarpgroups * kThreadsPerWarpgroup, "NUM_THREADS must match the dKV warpgroup layout.");
 // WG0/WG1 drain dKV to global memory; WG2 uses warp_idx 8/9/10/11 as MMA, S-TMA, dS-TMA, idle.
 
-#ifndef FLASHMLA_DKV_PHASE_DEBUG
-#define FLASHMLA_DKV_PHASE_DEBUG 1
-#endif
-
-#define DKV_DBG_PRINT(enabled, fmt, ...)                                                                                   \
-    do {                                                                                                                   \
-        if (FLASHMLA_DKV_PHASE_DEBUG && (enabled)) {                                                                       \
-            printf(                                                                                                        \
-                "[DKVDBG][B%d SQ%d CTA%d W%d WG%d L%d] " fmt "\n",                                                        \
-                static_cast<int>(blockIdx.x),                                                                              \
-                s_q_idx,                                                                                                   \
-                cta_idx,                                                                                                   \
-                warp_idx,                                                                                                  \
-                warpgroup_idx,                                                                                             \
-                lane_idx,                                                                                                  \
-                ##__VA_ARGS__                                                                                              \
-            );                                                                                                             \
-        }                                                                                                                  \
-    } while (0)
-
 template<typename TmaParamsType>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
     __grid_constant__ const SparseAttnBwdParams params,
@@ -97,22 +76,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         min(max(__ldg(params.topk_length + s_q_idx), 0), params.topk);
     const int num_k_blocks = max(params.topk / DKV_TILE_M, 1);
     const int* gIndices_s = params.indices + (int64_t)s_q_idx * params.stride_indices_s_q;
-    const bool dbg_block = blockIdx.x < 2;
-    const bool dbg_tid0 = dbg_block && tid == 0;
-    const bool dbg_warp0 = dbg_block && warp_idx == 0;
-    const bool dbg_s_tma = dbg_block && warp_idx == 9;
-    const bool dbg_ds_tma = dbg_block && warp_idx == 10;
-    const bool dbg_drain = dbg_block && warpgroup_idx < 2 && local_warp_idx == 0 && lane_idx == 0;
-    const bool dbg_mma = dbg_block && cta_idx == 0 && warp_idx == 8;
-
-    DKV_DBG_PRINT(
-        dbg_tid0,
-        "enter topk=%d topk_length=%d num_k_blocks=%d max_kv_i=%d",
-        params.topk,
-        topk_length,
-        num_k_blocks,
-        max_kv_i
-    );
 
     if (tid == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
@@ -120,11 +83,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_dO.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_S.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dS.get_tma_descriptor());
-        DKV_DBG_PRINT(dbg_tid0, "prefetch_tma_descriptors_done");
     }
 
     if (warp_idx == 0 && elect_one_sync()) {
-        DKV_DBG_PRINT(dbg_warp0, "barrier_init_begin");
         plan.bar_q_nope_ready.init(1);
         plan.bar_q_rope_ready.init(1);
         plan.bar_dO_ready.init(1);
@@ -143,19 +104,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
         plan.bar_dkv_part1_done.init(4 * kThreadsPerWarpgroup);
         plan.bar_dkv_part2_done.init(4 * kThreadsPerWarpgroup);
         fence_barrier_init();
-        DKV_DBG_PRINT(dbg_warp0, "barrier_init_done");
     }
 
-    DKV_DBG_PRINT(dbg_tid0, "cluster_sync_init_before");
     cluster_sync();
-    DKV_DBG_PRINT(dbg_tid0, "cluster_sync_init_after");
 
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.q_nope.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRoPE{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
     if (warp_idx == 0) {
         if (elect_one_sync()) {
-            DKV_DBG_PRINT(dbg_warp0, "launch_qdo_tma_begin");
             Tensor gQNoPE = tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, cta_idx, s_q_idx);
             ku::launch_tma_copy(
                 tma_params.tma_Q_nope,
@@ -182,45 +139,30 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 plan.bar_dO_ready,
                 TMA::CacheHintSm90::EVICT_FIRST
             );
-            DKV_DBG_PRINT(dbg_warp0, "launch_qdo_tma_done");
         }
 
         TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
         KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         TMEM::Allocator2Sm().release_allocation_lock();
-        DKV_DBG_PRINT(dbg_tid0, "tmem_allocate_done");
     }
-    DKV_DBG_PRINT(dbg_tid0, "__syncthreads_before");
     __syncthreads();
 
     const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
-    DKV_DBG_PRINT(dbg_tid0, "__syncthreads_after tmem_base=%u", tmem_base);
 
     if (warp_idx == 9) {
         const bool issue_s_tma = elect_one_sync();
-        DKV_DBG_PRINT(dbg_s_tma && issue_s_tma, "S-TMA enter");
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             if (issue_s_tma) {
                 const int buf = k_block % NUM_S_DS_BUFS;
                 const int phase = (k_block / NUM_S_DS_BUFS) & 1;
                 if (k_block >= NUM_S_DS_BUFS) {
-                    DKV_DBG_PRINT(
-                        dbg_s_tma,
-                        "S-TMA k=%d wait part2_ready buf=%d phase=%d wait_phase=%d",
-                        k_block,
-                        buf,
-                        phase,
-                        phase ^ 1
-                    );
                     plan.bar_dkv_part2_ready[buf].wait(phase ^ 1);
                     ku::tcgen05_after_thread_sync();
-                    DKV_DBG_PRINT(dbg_s_tma, "S-TMA k=%d wait_done part2_ready", k_block);
                 }
 
                 Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s[buf].data()), SmemLayoutS{});
                 Tensor gS = tma_params.tma_S.get_tma_tensor(tma_params.shape_S)(_, _, cta_idx, k_block, s_q_idx);
-                DKV_DBG_PRINT(dbg_s_tma, "S-TMA k=%d launch buf=%d phase=%d", k_block, buf, phase);
                 ku::launch_tma_copy(
                     tma_params.tma_S,
                     gS,
@@ -228,35 +170,22 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     plan.bar_s_ready[buf],
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
-                DKV_DBG_PRINT(dbg_s_tma, "S-TMA k=%d launch_done", k_block);
             }
         }
-        DKV_DBG_PRINT(dbg_s_tma && issue_s_tma, "S-TMA exit");
     } else if (warp_idx == 10) {
         const bool issue_ds_tma = elect_one_sync();
-        DKV_DBG_PRINT(dbg_ds_tma && issue_ds_tma, "dS-TMA enter");
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             if (issue_ds_tma) {
                 const int buf = k_block % NUM_S_DS_BUFS;
                 const int phase = (k_block / NUM_S_DS_BUFS) & 1;
                 if (k_block >= NUM_S_DS_BUFS) {
-                    DKV_DBG_PRINT(
-                        dbg_ds_tma,
-                        "dS-TMA k=%d wait part2_ready buf=%d phase=%d wait_phase=%d",
-                        k_block,
-                        buf,
-                        phase,
-                        phase ^ 1
-                    );
                     plan.bar_dkv_part2_ready[buf].wait(phase ^ 1);
                     ku::tcgen05_after_thread_sync();
-                    DKV_DBG_PRINT(dbg_ds_tma, "dS-TMA k=%d wait_done part2_ready", k_block);
                 }
 
                 Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds[buf].data()), SmemLayoutdS{});
                 Tensor gdS = tma_params.tma_dS.get_tma_tensor(tma_params.shape_dS)(_, _, cta_idx, k_block, s_q_idx);
-                DKV_DBG_PRINT(dbg_ds_tma, "dS-TMA k=%d launch buf=%d phase=%d", k_block, buf, phase);
                 ku::launch_tma_copy(
                     tma_params.tma_dS,
                     gdS,
@@ -264,10 +193,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     plan.bar_ds_ready[buf],
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
-                DKV_DBG_PRINT(dbg_ds_tma, "dS-TMA k=%d launch_done", k_block);
             }
         }
-        DKV_DBG_PRINT(dbg_ds_tma && issue_ds_tma, "dS-TMA exit");
     } else {
         if (warpgroup_idx < 2) {
             const int row = local_warp_idx * kThreadsPerWarp + lane_idx;
@@ -285,7 +212,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             static_assert(PART0_CHUNKS_PER_GROUP == 2);
             static_assert(PART12_NUM_CHUNKS == 2);
             static_assert(ROPE_NUM_CHUNKS == 2);
-            DKV_DBG_PRINT(dbg_drain, "drain enter row=%d chunk_group=%d", row, chunk_group);
 
             CUTE_NO_UNROLL
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -298,19 +224,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 }
                 const bool row_valid = kv_idx >= 0 && kv_idx < params.s_kv && kv_idx <= max_kv_i;
 
-                DKV_DBG_PRINT(
-                    dbg_drain,
-                    "drain k=%d wait part0_ready buf=%d phase=%d row_global=%d row_valid=%d kv_idx=%d",
-                    k_block,
-                    buf,
-                    phase,
-                    row_global,
-                    static_cast<int>(row_valid),
-                    kv_idx
-                );
                 plan.bar_dkv_part0_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait_done part0_ready", k_block);
                 CUTE_UNROLL
                 for (int local_chunk = 0; local_chunk < PART0_CHUNKS_PER_GROUP; ++local_chunk) {
                     const int chunk = chunk_group * PART0_CHUNKS_PER_GROUP + local_chunk;
@@ -326,12 +241,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     }
                 }
                 plan.bar_dkv_part0_done.arrive(static_cast<uint32_t>(0));
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d arrive part0_done", k_block);
 
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait rope_ready buf=%d phase=%d", k_block, buf, phase);
                 plan.bar_dkv_rope_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait_done rope_ready", k_block);
                 {
                     float2 dkv_rope_data[ROPE_CHUNK_SIZE / 2];
                     ku::tmem_ld_32dp32bNx<ROPE_CHUNK_SIZE>(tmem_cols::dKV_RoPE + chunk_group * ROPE_CHUNK_SIZE, dkv_rope_data);
@@ -345,12 +257,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     }
                 }
                 plan.bar_dkv_rope_done.arrive(static_cast<uint32_t>(0));
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d arrive rope_done", k_block);
 
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait part1_ready buf=%d phase=%d", k_block, buf, phase);
                 plan.bar_dkv_part1_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait_done part1_ready", k_block);
                 {
                     float2 dkv_part1_data[PART12_CHUNK_SIZE / 2];
                     ku::tmem_ld_32dp32bNx<PART12_CHUNK_SIZE>(tmem_cols::dKV_part1 + chunk_group * PART12_CHUNK_SIZE, dkv_part1_data);
@@ -364,12 +273,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     }
                 }
                 plan.bar_dkv_part1_done.arrive(static_cast<uint32_t>(0));
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d arrive part1_done", k_block);
 
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait part2_ready buf=%d phase=%d", k_block, buf, phase);
                 plan.bar_dkv_part2_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d wait_done part2_ready", k_block);
                 {
                     float2 dkv_part2_data[PART12_CHUNK_SIZE / 2];
                     ku::tmem_ld_32dp32bNx<PART12_CHUNK_SIZE>(tmem_cols::dKV_part2 + chunk_group * PART12_CHUNK_SIZE, dkv_part2_data);
@@ -383,28 +289,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                     }
                 }
                 plan.bar_dkv_part2_done.arrive(static_cast<uint32_t>(0));
-                DKV_DBG_PRINT(dbg_drain, "drain k=%d arrive part2_done", k_block);
             }
-            DKV_DBG_PRINT(dbg_drain, "drain exit");
         }
 
         if (cta_idx == 0 && warp_idx == 8 && elect_one_sync()) {
-            DKV_DBG_PRINT(dbg_mma, "MMA enter");
             plan.bar_q_nope_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
             plan.bar_q_rope_ready.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
             plan.bar_dO_ready.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
-            DKV_DBG_PRINT(dbg_mma, "MMA q/do arrive_and_expect_tx done");
 
-            DKV_DBG_PRINT(dbg_mma, "MMA wait q_nope_ready phase=0");
             plan.bar_q_nope_ready.wait(0);
-            DKV_DBG_PRINT(dbg_mma, "MMA wait_done q_nope_ready");
-            DKV_DBG_PRINT(dbg_mma, "MMA wait q_rope_ready phase=0");
             plan.bar_q_rope_ready.wait(0);
-            DKV_DBG_PRINT(dbg_mma, "MMA wait_done q_rope_ready");
-            DKV_DBG_PRINT(dbg_mma, "MMA wait dO_ready phase=0");
             plan.bar_dO_ready.wait(0);
             ku::tcgen05_after_thread_sync();
-            DKV_DBG_PRINT(dbg_mma, "MMA wait_done dO_ready");
 
             TiledMMA_dKV_Part0 tiled_mma_dKV_part0{};
             TiledMMA_dKV_Part1_2 tiled_mma_dKV_part1_2{};
@@ -433,49 +329,35 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s[buf].data()), SmemLayoutS_MMA{});
                 Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds[buf].data()), SmemLayoutdS_MMA{});
                 plan.bar_s_ready[buf].arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d arrive_and_expect_tx s_ready buf=%d phase=%d", k_block, buf, phase);
 
                 if (k_block > 0) {
-                    DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait part0_done round_phase=%d", k_block, round_phase ^ 1);
                     plan.bar_dkv_part0_done.wait(round_phase ^ 1);
                     ku::tcgen05_after_thread_sync();
-                    DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait_done part0_done", k_block);
                 }
 
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait s_ready phase=%d", k_block, phase);
                 plan.bar_s_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait_done s_ready", k_block);
                 ku::utcmma_ss(tiled_mma_dKV_part0, sS_mma, sdO_mma_full, tdKV_part0, true);
 
                 plan.bar_ds_ready[buf].arrive_and_expect_tx(B_H * DKV_TILE_M * sizeof(bf16));
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d arrive_and_expect_tx ds_ready", k_block);
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait ds_ready phase=%d", k_block, phase);
                 plan.bar_ds_ready[buf].wait(phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait_done ds_ready", k_block);
                 ku::utcmma_ss(tiled_mma_dKV_part0, sDS_mma, sQNoPE_mma_full, tdKV_part0, false);
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_part0_ready[buf], kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d arrive part0_ready", k_block);
 
                 if (k_block > 0) {
-                    DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait part2_done round_phase=%d", k_block, round_phase ^ 1);
                     plan.bar_dkv_part2_done.wait(round_phase ^ 1);
                     ku::tcgen05_after_thread_sync();
-                    DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait_done part2_done", k_block);
                 }
 
                 ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQRoPE_mma_full, tdKV_RoPE, true);
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_rope_ready[buf], kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d arrive rope_ready", k_block);
 
                 if (k_block > 0) {
-                    DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait part1_done round_phase=%d", k_block, round_phase ^ 1);
                     plan.bar_dkv_part1_done.wait(round_phase ^ 1);
                     ku::tcgen05_after_thread_sync();
-                    DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait_done part1_done", k_block);
                 }
 
                 ku::utcmma_ss(
@@ -494,12 +376,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 );
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_part1_ready[buf], kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d arrive part1_ready", k_block);
 
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait rope_done round_phase=%d", k_block, round_phase);
                 plan.bar_dkv_rope_done.wait(round_phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d wait_done rope_done", k_block);
 
                 ku::utcmma_ss(
                     tiled_mma_dKV_part1_2,
@@ -517,34 +396,23 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
                 );
                 ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dkv_part2_ready[buf], kClusterMask2Cta);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA k=%d arrive part2_ready", k_block);
             }
 
             if (num_k_blocks > 0) {
                 const int final_phase = (num_k_blocks - 1) & 1;
-                DKV_DBG_PRINT(dbg_mma, "MMA final wait part0_done phase=%d", final_phase);
                 plan.bar_dkv_part0_done.wait(final_phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA final wait_done part0_done");
-                DKV_DBG_PRINT(dbg_mma, "MMA final wait part1_done phase=%d", final_phase);
                 plan.bar_dkv_part1_done.wait(final_phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA final wait_done part1_done");
-                DKV_DBG_PRINT(dbg_mma, "MMA final wait part2_done phase=%d", final_phase);
                 plan.bar_dkv_part2_done.wait(final_phase);
                 ku::tcgen05_after_thread_sync();
-                DKV_DBG_PRINT(dbg_mma, "MMA final wait_done part2_done");
             }
-            DKV_DBG_PRINT(dbg_mma, "MMA exit");
         }
     }
 
-    DKV_DBG_PRINT(dbg_tid0, "cluster_sync_exit_before");
     cluster_sync();
-    DKV_DBG_PRINT(dbg_tid0, "cluster_sync_exit_after");
     if (warp_idx == 0) {
         TMEM::Allocator2Sm().free(tmem_base, 512);
-        DKV_DBG_PRINT(dbg_tid0, "tmem_free_done");
     }
 #endif
 }
@@ -702,5 +570,3 @@ void run_bwd_dkv_phase_kernel(const SparseAttnBwdParams& params) {
 }
 
 }  // namespace sm100::bwd::head128_2kernels::dkv
-
-#undef DKV_DBG_PRINT
