@@ -137,10 +137,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dkv_phase_kernel(
             plan.bar_dkv_part1_ready[buf].init(1);
             plan.bar_dkv_part2_ready[buf].init(1);
         }
-        plan.bar_dkv_part0_done.init(2 * kThreadsPerWarpgroup);
-        plan.bar_dkv_rope_done.init(2 * kThreadsPerWarpgroup);
-        plan.bar_dkv_part1_done.init(2 * kThreadsPerWarpgroup);
-        plan.bar_dkv_part2_done.init(2 * kThreadsPerWarpgroup);
+        // All dKV drain warpgroups from both CTAs arrive on CTA0's done barriers.
+        plan.bar_dkv_part0_done.init(4 * kThreadsPerWarpgroup);
+        plan.bar_dkv_rope_done.init(4 * kThreadsPerWarpgroup);
+        plan.bar_dkv_part1_done.init(4 * kThreadsPerWarpgroup);
+        plan.bar_dkv_part2_done.init(4 * kThreadsPerWarpgroup);
         fence_barrier_init();
         DKV_DBG_PRINT(dbg_warp0, "barrier_init_done");
     }
